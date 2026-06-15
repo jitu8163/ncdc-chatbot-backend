@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import json
 import logging
+import re
+from collections.abc import Iterator
 
 from openai import OpenAI
 
@@ -75,35 +77,30 @@ def _build_context(passages: list[dict]) -> str:
     return "\n\n".join(blocks)
 
 
-def classify_question(question: str) -> str:
-    """Classify a turn so the graph can skip retrieval for non-questions.
+# Greetings / thanks / smalltalk with no information need. Matched locally so we
+# don't spend a network round-trip (and ~1s) classifying every turn. Deliberately
+# conservative: anything that isn't an obvious pleasantry falls through to
+# "question" and goes through retrieval, so we never skip docs for a real need.
+_CHITCHAT_RE = re.compile(
+    r"^\s*(?:"
+    r"hi+|hey+|hello+|hiya|yo|sup|"
+    r"good\s*(?:morning|afternoon|evening|day)|greetings|"
+    r"thanks?(?:\s*you)?|thank\s*you|thx|ty|cheers|"
+    r"bye+|goodbye|see\s*you|see\s*ya|cya|"
+    r"ok(?:ay)?|cool|nice|great|awesome|got\s*it|"
+    r"how\s*are\s*you|who\s*are\s*you|what\s*can\s*you\s*do"
+    r")[\s!.?]*$",
+    re.IGNORECASE,
+)
 
-    Returns one of: "chitchat" (greeting/thanks/smalltalk) or "question".
+
+def classify_question(question: str) -> str:
+    """Classify a turn so the pipeline can skip retrieval for non-questions.
+
+    Returns "chitchat" (greeting/thanks/smalltalk) or "question". Uses a cheap
+    local pattern instead of an LLM call to keep latency down.
     """
-    try:
-        resp = _openai().chat.completions.create(
-            model=settings.openai_chat_model,
-            temperature=0.0,
-            response_format={"type": "json_object"},
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "Classify the user's message for an NCDC guideline assistant. "
-                        'Respond with JSON {"label": "chitchat" | "question"}. '
-                        '"chitchat" = greetings, thanks, goodbyes or smalltalk with no '
-                        'information need. "question" = anything that may need the '
-                        "guideline documents to answer."
-                    ),
-                },
-                {"role": "user", "content": question},
-            ],
-        )
-        label = json.loads(resp.choices[0].message.content).get("label", "question")
-        return "chitchat" if label == "chitchat" else "question"
-    except Exception:  # noqa: BLE001 - on any failure, treat as a real question
-        logger.exception("Question classification failed")
-        return "question"
+    return "chitchat" if _CHITCHAT_RE.match(question or "") else "question"
 
 
 def rewrite_query(question: str, history: list[dict] | None) -> str:
@@ -191,6 +188,165 @@ def generate_answer(
     sources_used = [int(s) for s in data.get("sources_used", []) if isinstance(s, (int, float))]
     followups = [str(f) for f in data.get("followups", [])][:3]
     return {
+        "answer": answer,
+        "answered": answered,
+        "sources_used": sources_used,
+        "followups": followups,
+    }
+
+
+_JSON_UNESCAPE = {
+    '"': '"', "\\": "\\", "/": "/",
+    "b": "\b", "f": "\f", "n": "\n", "r": "\r", "t": "\t",
+}
+
+
+class _AnswerFieldDecoder:
+    """Incrementally decode the JSON string value of the top-level "answer" key
+    from a streamed chat completion.
+
+    The model still returns a single JSON object (answer + answered +
+    sources_used + followups), but we want to forward just the answer prose to
+    the client as it arrives. This walks the streamed characters, finds the
+    answer value and JSON-unescapes it on the fly; the remaining metadata is
+    parsed from the complete buffer once the stream ends.
+    """
+
+    def __init__(self) -> None:
+        self._raw = ""
+        self._pos = 0
+        self._in_value = False
+        self._done = False
+        self._escape = False
+        self._uni = ""  # collects "u" + 4 hex digits of a \uXXXX escape
+
+    def feed(self, delta: str) -> str:
+        if self._done:
+            return ""
+        self._raw += delta
+        out: list[str] = []
+        while self._pos < len(self._raw):
+            if not self._in_value:
+                m = re.search(r'"answer"\s*:\s*"', self._raw[self._pos:])
+                if not m:
+                    break  # value start not in buffer yet; wait for more
+                self._pos += m.end()
+                self._in_value = True
+                continue
+            ch = self._raw[self._pos]
+            self._pos += 1
+            if self._uni:
+                self._uni += ch
+                if len(self._uni) == 5:
+                    try:
+                        out.append(chr(int(self._uni[1:], 16)))
+                    except ValueError:
+                        pass
+                    self._uni = ""
+                    self._escape = False
+                continue
+            if self._escape:
+                if ch == "u":
+                    self._uni = "u"
+                else:
+                    out.append(_JSON_UNESCAPE.get(ch, ch))
+                    self._escape = False
+                continue
+            if ch == "\\":
+                self._escape = True
+                continue
+            if ch == '"':  # closing quote -> answer value complete
+                self._done = True
+                break
+            out.append(ch)
+        return "".join(out)
+
+
+def stream_answer(
+    question: str,
+    passages: list[dict],
+    history: list[dict] | None = None,
+    language: str | None = None,
+) -> Iterator[dict]:
+    """Stream a grounded answer.
+
+    Yields:
+      {"type": "delta", "text": <answer chunk>}   — zero or more, in order
+      {"type": "final", "answer", "answered", "sources_used", "followups"}  — exactly once
+
+    The final event carries the canonical values (parsed from the complete JSON)
+    used for persistence + citations.
+    """
+    if not passages:
+        yield {
+            "type": "final",
+            "answer": NO_INFO_MESSAGE,
+            "answered": False,
+            "sources_used": [],
+            "followups": [],
+        }
+        return
+
+    messages: list[dict] = [{"role": "system", "content": SYSTEM_PROMPT}]
+    for turn in (history or [])[-6:]:
+        messages.append({"role": turn["role"], "content": turn["content"]})
+    lang_hint = f"\n\n(Respond in: {language})" if language else ""
+    messages.append(
+        {
+            "role": "user",
+            "content": (
+                f"SOURCES:\n{_build_context(passages)}\n\n"
+                f"QUESTION: {question}{lang_hint}"
+            ),
+        }
+    )
+
+    decoder = _AnswerFieldDecoder()
+    raw_parts: list[str] = []
+    shown_parts: list[str] = []
+    try:
+        stream = _openai().chat.completions.create(
+            model=settings.openai_chat_model,
+            messages=messages,
+            temperature=0.1,
+            response_format={"type": "json_object"},
+            stream=True,
+        )
+        for chunk in stream:
+            if not chunk.choices:
+                continue
+            piece = chunk.choices[0].delta.content or ""
+            if not piece:
+                continue
+            raw_parts.append(piece)
+            text = decoder.feed(piece)
+            if text:
+                shown_parts.append(text)
+                yield {"type": "delta", "text": text}
+    except Exception:  # noqa: BLE001
+        logger.exception("LLM streaming generation failed")
+        yield {
+            "type": "final",
+            "answer": NO_INFO_MESSAGE,
+            "answered": False,
+            "sources_used": [],
+            "followups": [],
+        }
+        return
+
+    streamed = "".join(shown_parts).strip()
+    try:
+        data = json.loads("".join(raw_parts))
+    except Exception:  # noqa: BLE001 - fall back to the text we already streamed
+        logger.warning("Could not parse streamed answer JSON; using extracted text")
+        data = {}
+
+    answer = (data.get("answer") or "").strip() or streamed or NO_INFO_MESSAGE
+    answered = bool(data.get("answered", False)) and answer != NO_INFO_MESSAGE
+    sources_used = [int(s) for s in data.get("sources_used", []) if isinstance(s, (int, float))]
+    followups = [str(f) for f in data.get("followups", [])][:3]
+    yield {
+        "type": "final",
         "answer": answer,
         "answered": answered,
         "sources_used": sources_used,

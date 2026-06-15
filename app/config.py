@@ -56,7 +56,10 @@ class Settings(BaseSettings):
     use_hybrid_search: bool = True
     use_reranker: bool = True
     reranker_model: str = "BAAI/bge-reranker-v2-m3"
-    retrieve_top_k: int = 40
+    # First-stage recall fed to the cross-encoder. On CPU the reranker dominates
+    # latency and its cost is ~linear in this number, so keep it modest. Bump it
+    # back up (and/or set embed_device="cuda") when running on a GPU.
+    retrieve_top_k: int = 15
     rerank_top_k: int = 8
     min_rerank_score: float = 0.0
 

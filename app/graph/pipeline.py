@@ -101,11 +101,14 @@ def _citation_url(document_id: str, page: int | None) -> str:
     return f"{base}#page={page}" if page else base
 
 
-def citations_node(state: ChatState) -> ChatState:
-    passages = state["passages"]
+def build_citations(passages: list[dict], sources_used: list[int]) -> list[dict]:
+    """Map the LLM's cited source numbers to deduplicated citation records.
+
+    Shared by the graph's citations_node and the streaming chat endpoint.
+    """
     citations: list[dict] = []
     seen: set[tuple[str, int | None]] = set()
-    for idx in state.get("sources_used", []):
+    for idx in sources_used or []:
         if 1 <= idx <= len(passages):
             p = passages[idx - 1]
             key = (p["document_id"], p.get("page"))
@@ -122,7 +125,11 @@ def citations_node(state: ChatState) -> ChatState:
                     "url": _citation_url(p["document_id"], p.get("page")),
                 }
             )
-    return {"citations": citations}
+    return citations
+
+
+def citations_node(state: ChatState) -> ChatState:
+    return {"citations": build_citations(state["passages"], state.get("sources_used", []))}
 
 
 def format_node(state: ChatState) -> ChatState:
