@@ -1,0 +1,54 @@
+[project]
+name = "ncdc-chatbot-backend"
+version = "0.1.0"
+description = "RAG chatbot backend for NCDC guideline documents (FastAPI + Qdrant + OpenAI)"
+readme = "README.md"
+requires-python = ">=3.11,<3.14"
+dependencies = [
+    # Web framework
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.32.0",
+    "python-multipart>=0.0.12",
+    # Config / validation
+    "pydantic[email]>=2.9.0",
+    "pydantic-settings>=2.6.0",
+    # Relational DB (PostgreSQL per architecture; sqlite supported for dev)
+    "sqlalchemy>=2.0.36",
+    "psycopg[binary]>=3.2.0",
+    "alembic>=1.14.0",
+    # Auth
+    "pyjwt>=2.10.0",
+    "bcrypt>=4.2.0",
+    # Orchestration
+    "langgraph>=0.2.50",
+    # Cache / rate limiting
+    "redis>=5.2.0",
+    # AI / RAG
+    "openai>=1.54.0",                       # answer LLM (gpt-4o-mini)
+    "qdrant-client>=1.12.0",
+    "sentence-transformers>=3.3.0",         # BAAI/bge-m3 dense + bge-reranker-v2-m3
+    "fastembed>=0.4.2",                     # BM25 sparse vectors
+    "tiktoken>=0.8.0",
+    # PDF processing
+    "pymupdf>=1.24.0",
+]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.7.0",
+    "httpx>=0.27.0",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["app"]
