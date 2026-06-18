@@ -1,4 +1,4 @@
-"""Qdrant vector store with native hybrid search (dense + BM25 sparse, RRF fusion).
+"""Qdrant vector store with plain dense vector search (MVP — no BM25/hybrid).
 
 Scale notes (1000-page docs × 100 uploads ≈ hundreds of thousands of points):
   * A single collection with payload indexes on `document_id`, `enabled`, `category`
@@ -9,6 +9,7 @@ Scale notes (1000-page docs × 100 uploads ≈ hundreds of thousands of points):
 """
 from __future__ import annotations
 
+import logging
 import uuid
 from functools import lru_cache
 
@@ -17,28 +18,41 @@ from qdrant_client import QdrantClient, models
 from app.config import settings
 from app.services.chunking import Chunk
 
+logger = logging.getLogger("ncdc.qdrant")
+
 DENSE = "dense"
-SPARSE = "bm25"
 
 
 @lru_cache(maxsize=1)
 def get_client() -> QdrantClient:
-    return QdrantClient(url=settings.qdrant_url, api_key=settings.qdrant_api_key or None)
+    return QdrantClient(
+        url=settings.qdrant_url,
+        api_key=settings.qdrant_api_key or None,
+        timeout=settings.qdrant_timeout,
+    )
 
 
 def ensure_collection() -> None:
     client = get_client()
     if client.collection_exists(settings.qdrant_collection):
-        return
+        # If the embedding model (and thus vector size) changed, the stored vectors
+        # are no longer comparable — drop and recreate so re-indexing rebuilds them.
+        info = client.get_collection(settings.qdrant_collection)
+        current = info.config.params.vectors[DENSE].size
+        if current == settings.embedding_dim:
+            return
+        logger.warning(
+            "Dense vector size changed (%s -> %s); recreating collection %r. "
+            "All documents must be re-indexed.",
+            current, settings.embedding_dim, settings.qdrant_collection,
+        )
+        client.delete_collection(settings.qdrant_collection)
     client.create_collection(
         collection_name=settings.qdrant_collection,
         vectors_config={
             DENSE: models.VectorParams(
                 size=settings.embedding_dim, distance=models.Distance.COSINE
             )
-        },
-        sparse_vectors_config={
-            SPARSE: models.SparseVectorParams(modifier=models.Modifier.IDF)
         },
         # Keep raw vectors on disk; HNSW graph + payload index stay in RAM.
         on_disk_payload=True,
@@ -63,17 +77,13 @@ def upsert_chunks(
     enabled: bool,
     chunks: list[Chunk],
     dense_vectors: list[list[float]],
-    sparse_vectors: list[tuple[list[int], list[float]]],
 ) -> None:
     points: list[models.PointStruct] = []
-    for chunk, dense, (idx, val) in zip(chunks, dense_vectors, sparse_vectors, strict=True):
+    for chunk, dense in zip(chunks, dense_vectors, strict=True):
         points.append(
             models.PointStruct(
                 id=_point_id(document_id, chunk.ordinal),
-                vector={
-                    DENSE: dense,
-                    SPARSE: models.SparseVector(indices=idx, values=val),
-                },
+                vector={DENSE: dense},
                 payload={
                     "document_id": document_id,
                     "document_title": document_title,
@@ -82,9 +92,7 @@ def upsert_chunks(
                     "page": chunk.page,
                     "section": chunk.section,
                     "ordinal": chunk.ordinal,
-                    "parent_ordinal": chunk.parent_ordinal,
-                    "text": chunk.text,                 # child (matched) text
-                    "parent_text": chunk.parent_text,   # parent context for the LLM
+                    "text": chunk.text,   # matched + fed to the LLM
                 },
             )
         )
@@ -124,47 +132,25 @@ def _search_filter(category: str | None) -> models.Filter:
 
 
 def search(
-    query_text: str,
     dense_vector: list[float],
-    sparse_vector: tuple[list[int], list[float]] | None,
     limit: int,
     category: str | None = None,
 ) -> list[dict]:
-    """Hybrid (RRF) when a sparse vector is supplied, else dense-only.
+    """Plain dense vector search.
 
     Returns a list of payload dicts augmented with the retrieval `score`.
     """
     client = get_client()
     flt = _search_filter(category)
 
-    if sparse_vector is not None:
-        idx, val = sparse_vector
-        result = client.query_points(
-            collection_name=settings.qdrant_collection,
-            prefetch=[
-                models.Prefetch(
-                    query=dense_vector, using=DENSE, filter=flt, limit=limit
-                ),
-                models.Prefetch(
-                    query=models.SparseVector(indices=idx, values=val),
-                    using=SPARSE,
-                    filter=flt,
-                    limit=limit,
-                ),
-            ],
-            query=models.FusionQuery(fusion=models.Fusion.RRF),
-            limit=limit,
-            with_payload=True,
-        )
-    else:
-        result = client.query_points(
-            collection_name=settings.qdrant_collection,
-            query=dense_vector,
-            using=DENSE,
-            query_filter=flt,
-            limit=limit,
-            with_payload=True,
-        )
+    result = client.query_points(
+        collection_name=settings.qdrant_collection,
+        query=dense_vector,
+        using=DENSE,
+        query_filter=flt,
+        limit=limit,
+        with_payload=True,
+    )
 
     hits: list[dict] = []
     for point in result.points:

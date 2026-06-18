@@ -30,6 +30,11 @@ class Settings(BaseSettings):
     qdrant_url: str = "http://localhost:6333"
     qdrant_api_key: str | None = None
     qdrant_collection: str = "ncdc_documents"
+    # Per-operation timeout (seconds). The default qdrant-client REST timeout is
+    # short; a remote (e.g. Qdrant Cloud) cluster with high round-trip latency can
+    # make `wait=True` upserts during ingestion exceed it. Keep this generous so
+    # indexing writes don't time out — searches still return quickly.
+    qdrant_timeout: float = 60.0
 
     # Redis (cache + rate limiting)
     redis_url: str = "redis://localhost:6379/0"
@@ -41,34 +46,44 @@ class Settings(BaseSettings):
     rate_limit_per_minute: int = 30     # /api/chat requests per client IP per minute
 
     # Answer LLM (OpenAI-compatible Chat Completions API).
-    # Leave openai_base_url empty for OpenAI itself; set it to an OpenAI-compatible
-    # endpoint (e.g. Groq: https://api.groq.com/openai/v1) to use another provider.
+    # Default points at Groq for sub-second generation; set OPENAI_API_KEY to your
+    # Groq key. Leave openai_base_url empty to use OpenAI (gpt-4o-mini) instead.
     openai_api_key: str = ""
-    openai_base_url: str | None = None
-    openai_chat_model: str = "gpt-4o-mini"
+    openai_base_url: str | None = "https://api.groq.com/openai/v1"
+    openai_chat_model: str = "llama-3.3-70b-versatile"
+    # Follow-up query rewrite runs *before* streaming starts, so it uses a small,
+    # fast model (the task is trivial) to keep time-to-first-token low. Falls back
+    # to openai_chat_model if left blank.
+    rewrite_model: str = "llama-3.1-8b-instant"
+    # Hard timeouts so a stalled provider can never blow the latency budget.
+    # llm_request_timeout caps any single LLM call (the SDK default is 600s);
+    # rewrite_timeout is a tighter cap on the pre-stream rewrite, which falls back
+    # to the original question if the model is slow.
+    llm_request_timeout: float = 12.0
+    rewrite_timeout: float = 1.5
 
-    # Embeddings — BAAI/bge-m3 dense (local, multilingual) + BM25 sparse
-    embedding_model: str = "BAAI/bge-m3"
-    embedding_dim: int = 1024
-    embed_device: str = "cpu"           # "cuda" if a GPU is available
+    # Embeddings — small multilingual ONNX bi-encoder via FastEmbed (CPU-friendly).
+    # 384-dim. Changing this model requires re-indexing the corpus.
+    embedding_model: str = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+    embedding_dim: int = 384
+    embed_device: str = "cpu"           # unused by the ONNX path; kept for compatibility
 
-    # Retrieval
-    use_hybrid_search: bool = True
-    use_reranker: bool = True
-    reranker_model: str = "BAAI/bge-reranker-v2-m3"
-    # First-stage recall fed to the cross-encoder. On CPU the reranker dominates
-    # latency and its cost is ~linear in this number, so keep it modest. Bump it
-    # back up (and/or set embed_device="cuda") when running on a GPU.
-    retrieve_top_k: int = 15
-    rerank_top_k: int = 8
-    min_rerank_score: float = 0.0
+    # Retrieval (MVP: plain dense vector search — no BM25 hybrid, no reranker)
+    retrieve_top_k: int = 15   # candidates pulled from Qdrant
+    final_top_k: int = 6       # passages kept and sent to the LLM
 
-    # Ingestion / parent-child chunking
-    # Children are embedded + searched (precise match); the larger parent block
-    # is fed to the LLM (richer context). Both stay within one page → exact citations.
-    parent_chunk_tokens: int = 1200
-    child_chunk_tokens: int = 350
-    child_overlap_tokens: int = 60
+    # PDF extraction
+    # MVP runs on the PDF text layer only. Tables are still pulled out as markdown
+    # (PyMuPDF find_tables) since that comes straight from the parser. Image-only
+    # pages (scans / flowcharts) carry no text layer and are skipped — there is no
+    # OCR fallback, so scanned-only documents will index no text.
+    extract_tables: bool = True
+
+    # Ingestion / chunking (MVP: single-level fixed-size chunks)
+    # Each chunk is embedded + searched and fed to the LLM as-is. Chunks never cross
+    # a page boundary, so every chunk maps to exactly one page → exact citations.
+    chunk_tokens: int = 500
+    chunk_overlap_tokens: int = 60
     embed_batch_size: int = 64
     upload_dir: str = "./storage/documents"
     max_upload_mb: int = 200

@@ -3,14 +3,32 @@
 Designed to stream page-by-page so a 1000-page document never needs to be
 fully materialised in memory. For each page we return the text plus a best-effort
 "section" label (nearest preceding heading) used for citation references.
+
+Two extraction layers run per page (text layer only — no OCR):
+  1. Plain text from the text layer (fast, the common case).
+  2. Tables detected by PyMuPDF are emitted as markdown so the row/column
+     structure survives chunking (find_tables / to_markdown).
+
+Image-only pages (scans / flowcharts) carry no text layer; for this MVP they are
+simply skipped rather than OCR'd, so a purely scanned document will index no text.
+
+Running headers/footers that repeat across most pages are stripped so they
+don't pollute every chunk.
 """
 from __future__ import annotations
 
+import logging
+import re
 import statistics
 from collections.abc import Iterator
 from dataclasses import dataclass
+from functools import lru_cache
 
 import fitz  # PyMuPDF
+
+from app.config import settings
+
+logger = logging.getLogger("ncdc.pdf")
 
 
 @dataclass
@@ -33,17 +51,65 @@ def _looks_like_heading(text: str) -> bool:
     return True
 
 
+def _tables(page: fitz.Page) -> tuple[list[str], list[fitz.Rect]]:
+    """Return (markdown tables, their bounding rects) for a page."""
+    if not settings.extract_tables:
+        return [], []
+    markdowns: list[str] = []
+    rects: list[fitz.Rect] = []
+    try:
+        for table in page.find_tables().tables:
+            md = (table.to_markdown() or "").strip()
+            if md:
+                markdowns.append(md)
+                rects.append(fitz.Rect(table.bbox))
+    except Exception:  # noqa: BLE001 - table detection is best-effort
+        logger.exception("Table extraction failed for page %s", page.number)
+    return markdowns, rects
+
+
+def _in_any(rect: fitz.Rect, rects: list[fitz.Rect]) -> bool:
+    if not rects:
+        return False
+    cx, cy = (rect.x0 + rect.x1) / 2, (rect.y0 + rect.y1) / 2
+    return any(r.x0 <= cx <= r.x1 and r.y0 <= cy <= r.y1 for r in rects)
+
+
+def _norm(line: str) -> str:
+    # Normalise for boilerplate matching: drop digits (page numbers vary) + ws.
+    return re.sub(r"\s+", " ", re.sub(r"\d+", "", line)).strip().lower()
+
+
+def _boilerplate(doc: fitz.Document) -> set[str]:
+    """Normalised lines that repeat on most pages (running headers/footers)."""
+    if doc.page_count < 4:
+        return set()
+    counts: dict[str, int] = {}
+    sample = min(doc.page_count, 15)
+    for index in range(sample):
+        seen: set[str] = set()
+        for line in doc.load_page(index).get_text("text").splitlines():
+            key = _norm(line)
+            if 6 <= len(key) <= 80:
+                seen.add(key)
+        for key in seen:
+            counts[key] = counts.get(key, 0) + 1
+    threshold = max(3, int(sample * 0.6))
+    return {key for key, n in counts.items() if n >= threshold}
+
+
 def iter_pages(file_path: str) -> Iterator[PageContent]:
     """Yield page content lazily; carries the current section across pages."""
     doc = fitz.open(file_path)
     current_section: str | None = None
     try:
-        # Establish a body-text font size baseline from a sample of pages.
         body_size = _estimate_body_font_size(doc)
+        boilerplate = _boilerplate(doc)
 
         for index in range(doc.page_count):
             page = doc.load_page(index)
             data = page.get_text("dict")
+            table_md, table_rects = _tables(page)
             plain_lines: list[str] = []
 
             for block in data.get("blocks", []):
@@ -52,7 +118,10 @@ def iter_pages(file_path: str) -> Iterator[PageContent]:
                     if not spans:
                         continue
                     line_text = "".join(s.get("text", "") for s in spans).strip()
-                    if not line_text:
+                    if not line_text or _norm(line_text) in boilerplate:
+                        continue
+                    # Skip text that lives inside a detected table (emitted as md below).
+                    if _in_any(fitz.Rect(line.get("bbox")), table_rects):
                         continue
                     plain_lines.append(line_text)
 
@@ -63,7 +132,11 @@ def iter_pages(file_path: str) -> Iterator[PageContent]:
                     ):
                         current_section = line_text
 
-            text = "\n".join(plain_lines).strip()
+            parts = plain_lines + table_md
+            text = "\n".join(parts).strip()
+
+            # Image-only pages (flowchart/scan) have no text layer and are skipped
+            # (no OCR in the MVP); they simply yield empty text for that page.
             yield PageContent(page_number=index + 1, text=text, section=current_section)
     finally:
         doc.close()

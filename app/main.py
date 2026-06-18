@@ -13,7 +13,7 @@ from app.database import Base, SessionLocal, engine
 from app.models import User, UserRole
 from app.routers import analytics, auth, chat, documents
 from app.security import hash_password
-from app.services import embeddings, qdrant_service, reranker
+from app.services import embeddings, qdrant_service
 
 logging.basicConfig(
     level=getattr(logging, settings.log_level.upper(), logging.INFO),
@@ -49,13 +49,12 @@ def _seed_first_admin() -> None:
 
 
 def _warmup_models() -> None:
-    """Pre-load the local embedding + reranker models off the request path so the
-    first user query doesn't pay the (slow) cold-load cost. Runs in a background
-    thread; failures are non-fatal (models load lazily on first use anyway)."""
+    """Pre-load the local embedding model off the request path so the first user
+    query doesn't pay the (slow) cold-load cost. Runs in a background thread;
+    failures are non-fatal (the model loads lazily on first use anyway)."""
     try:
         embeddings.warmup()
-        reranker.warmup()
-        logger.info("Embedding/reranker models warmed up")
+        logger.info("Embedding model warmed up")
     except Exception:  # noqa: BLE001
         logger.exception("Model warmup failed (will load lazily on first query)")
 

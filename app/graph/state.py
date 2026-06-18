@@ -14,7 +14,7 @@ class ChatState(TypedDict, total=False):
     # Working values
     route: str                     # "chitchat" | "question"
     search_query: str              # rewritten, standalone query
-    passages: list[dict]           # reranked, parent-expanded retrieval results
+    passages: list[dict]           # dense-search retrieval results
 
     # Outputs
     answer: str

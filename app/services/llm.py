@@ -31,6 +31,11 @@ def _openai() -> OpenAI:
         _client = OpenAI(
             api_key=settings.openai_api_key,
             base_url=settings.openai_base_url or None,
+            # Cap every call so a stalled provider can't exceed the latency budget
+            # (the SDK default is 600s). Disable the automatic retries that would
+            # otherwise multiply that wait on a transient error.
+            timeout=settings.llm_request_timeout,
+            max_retries=0,
         )
     return _client
 
@@ -112,8 +117,11 @@ def rewrite_query(question: str, history: list[dict] | None) -> str:
         return question
     try:
         convo = "\n".join(f"{t['role']}: {t['content']}" for t in history[-6:])
-        resp = _openai().chat.completions.create(
-            model=settings.openai_chat_model,
+        # Tight per-call timeout: this runs *before* streaming starts, so if the
+        # rewrite is slow we fall back to the original question rather than make
+        # the user wait. (Handled by the except below on timeout.)
+        resp = _openai().with_options(timeout=settings.rewrite_timeout).chat.completions.create(
+            model=settings.rewrite_model or settings.openai_chat_model,
             temperature=0.0,
             response_format={"type": "json_object"},
             messages=[
@@ -193,6 +201,26 @@ def generate_answer(
         "sources_used": sources_used,
         "followups": followups,
     }
+
+
+def _loads_json_object(raw: str) -> dict | None:
+    """Parse a JSON object from a model response, tolerating stray wrapping.
+
+    Since the streaming call no longer enforces JSON mode at the API level, the
+    model could (rarely) wrap the object in markdown fences or add a stray word.
+    Try a strict parse first, then fall back to the outermost {...} slice.
+    """
+    raw = raw.strip()
+    try:
+        return json.loads(raw)
+    except Exception:  # noqa: BLE001
+        start, end = raw.find("{"), raw.rfind("}")
+        if start != -1 and end > start:
+            try:
+                return json.loads(raw[start : end + 1])
+            except Exception:  # noqa: BLE001
+                return None
+    return None
 
 
 _JSON_UNESCAPE = {
@@ -305,11 +333,16 @@ def stream_answer(
     raw_parts: list[str] = []
     shown_parts: list[str] = []
     try:
+        # NOTE: we deliberately do NOT pass response_format={"type": "json_object"}
+        # here. Groq buffers the *entire* response into a single chunk when JSON
+        # mode is on, which defeats streaming (the answer arrives all at once).
+        # The SYSTEM_PROMPT already instructs the model to emit a JSON object, so
+        # we still get well-formed JSON — just streamed token-by-token, which the
+        # decoder below turns into live answer deltas.
         stream = _openai().chat.completions.create(
             model=settings.openai_chat_model,
             messages=messages,
             temperature=0.1,
-            response_format={"type": "json_object"},
             stream=True,
         )
         for chunk in stream:
@@ -335,9 +368,8 @@ def stream_answer(
         return
 
     streamed = "".join(shown_parts).strip()
-    try:
-        data = json.loads("".join(raw_parts))
-    except Exception:  # noqa: BLE001 - fall back to the text we already streamed
+    data = _loads_json_object("".join(raw_parts))
+    if data is None:  # fall back to the text we already streamed
         logger.warning("Could not parse streamed answer JSON; using extracted text")
         data = {}
 

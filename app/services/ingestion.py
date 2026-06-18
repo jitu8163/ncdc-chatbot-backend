@@ -51,11 +51,6 @@ def process_document(document_id: str) -> None:
         for batch in _batched(chunks, settings.embed_batch_size):
             texts = [c.text for c in batch]
             dense = embeddings.embed_texts(texts)
-            sparse = (
-                embeddings.sparse_embed_documents(texts)
-                if settings.use_hybrid_search
-                else [([], []) for _ in texts]
-            )
             qdrant_service.upsert_chunks(
                 document_id=doc.id,
                 document_title=doc.title,
@@ -63,7 +58,6 @@ def process_document(document_id: str) -> None:
                 enabled=doc.enabled,
                 chunks=batch,
                 dense_vectors=dense,
-                sparse_vectors=sparse,
             )
             total += len(batch)
             logger.info("Indexed %s/%s chunks for %s", total, len(chunks), doc.id)

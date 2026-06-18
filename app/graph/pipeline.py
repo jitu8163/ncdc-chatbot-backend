@@ -6,7 +6,7 @@ Flow (maps to the architecture's node list):
       -> classify            (Question Classifier)
          -> chitchat -> END  (greeting / smalltalk short-circuit, no retrieval)
          -> rewrite          (Query Rewriter — resolve follow-ups to a standalone query)
-            -> retrieve       (Hybrid Search + Reranker + parent expansion)
+            -> retrieve       (Dense vector search)
             -> generate       (Context Builder + LLM)
             -> citations      (Citation Engine: builder/page/section/hyperlink)
             -> format         (Response Formatter)
@@ -72,7 +72,7 @@ def retrieve_node(state: ChatState) -> ChatState:
 def _answer_signature(state: ChatState) -> tuple[str, ...]:
     sig = [state["search_query"], state.get("language") or ""]
     for p in state["passages"]:
-        sig.append(f"{p.get('document_id')}:{p.get('page')}:{p.get('parent_ordinal', '')}")
+        sig.append(f"{p.get('document_id')}:{p.get('page')}")
     return tuple(sig)
 
 
