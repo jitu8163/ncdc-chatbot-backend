@@ -73,11 +73,17 @@ class Settings(BaseSettings):
     final_top_k: int = 6       # passages kept and sent to the LLM
 
     # PDF extraction
-    # MVP runs on the PDF text layer only. Tables are still pulled out as markdown
-    # (PyMuPDF find_tables) since that comes straight from the parser. Image-only
-    # pages (scans / flowcharts) carry no text layer and are skipped — there is no
-    # OCR fallback, so scanned-only documents will index no text.
+    # Tables are pulled out as markdown (PyMuPDF find_tables) so the row/column
+    # structure survives chunking.
     extract_tables: bool = True
+
+    # OCR fallback for scanned / image-only pages (RapidOCR — ONNX on CPU, so no
+    # system Tesseract binary is required). When a page's text layer has fewer than
+    # ocr_min_chars characters, the page is rendered at ocr_dpi and OCR'd. OCR is
+    # ~5-10x slower than text extraction, so it only runs on pages that need it.
+    ocr_enabled: bool = True
+    ocr_dpi: int = 200          # render resolution; higher = better accuracy, slower
+    ocr_min_chars: int = 80     # text-layer length below which a page is OCR'd
 
     # Ingestion / chunking (MVP: single-level fixed-size chunks)
     # Each chunk is embedded + searched and fed to the LLM as-is. Chunks never cross

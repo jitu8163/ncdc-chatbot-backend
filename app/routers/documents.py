@@ -167,6 +167,7 @@ def reindex_document(
     qdrant_service.delete_document(doc.id)
     doc.status = DocumentStatus.pending
     doc.chunk_count = 0
+    doc.progress = 0.0
     _audit(db, admin.id, "document.reindex", doc.id, doc.title)
     db.commit()
     background.add_task(ingestion.process_document, doc.id)

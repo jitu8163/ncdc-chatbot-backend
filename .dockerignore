@@ -1,0 +1,26 @@
+# Python virtualenv / caches — rebuilt inside the image
+.venv/
+__pycache__/
+*.pyc
+.ruff_cache/
+.pytest_cache/
+
+# Secrets & local state — never bake into the image
+.env
+.env.*
+!.env.example
+*.db
+*.sqlite
+*.sqlite3
+
+# Local uploads / model cache / runtime data (use volumes instead)
+storage/
+.cache/
+
+# VCS / editor / OS junk
+.git/
+.gitignore
+.idea/
+.vscode/
+*.log
+.DS_Store

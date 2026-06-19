@@ -9,12 +9,13 @@ keeping citations (page + section) exact, which the SOW requires.
 """
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import tiktoken
 
 from app.config import settings
-from app.services.pdf_processor import iter_pages
+from app.services.pdf_processor import iter_pages, page_count
 
 # cl100k_base is a reasonable, model-agnostic tokenizer for sizing chunks.
 _enc = tiktoken.get_encoding("cl100k_base")
@@ -44,14 +45,24 @@ def _split_tokens(text: str, max_tokens: int, overlap: int) -> list[str]:
     return out
 
 
-def chunk_document(file_path: str) -> tuple[list[Chunk], int]:
-    """Return (chunks, page_count). Streams pages to keep memory bounded."""
+def chunk_document(
+    file_path: str,
+    progress_cb: Callable[[float], None] | None = None,
+) -> tuple[list[Chunk], int]:
+    """Return (chunks, page_count). Streams pages to keep memory bounded.
+
+    If ``progress_cb`` is given it is called after each page with a 0–100 percentage
+    of the extraction phase (so a slow OCR pass still shows live progress).
+    """
     chunks: list[Chunk] = []
     ordinal = 0
     pages = 0
+    total_pages = page_count(file_path) or 1
 
     for page in iter_pages(file_path):
         pages = page.page_number
+        if progress_cb:
+            progress_cb(min(100.0, page.page_number / total_pages * 100.0))
         if not page.text.strip():
             continue
 

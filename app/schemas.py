@@ -42,6 +42,7 @@ class DocumentOut(BaseModel):
     enabled: bool
     page_count: int
     chunk_count: int
+    progress: float
     file_size: int
     error: str | None
     created_at: datetime

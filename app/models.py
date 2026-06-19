@@ -68,6 +68,9 @@ class Document(Base):
     file_size: Mapped[int] = mapped_column(Integer, default=0)
     page_count: Mapped[int] = mapped_column(Integer, default=0)
     chunk_count: Mapped[int] = mapped_column(Integer, default=0)
+    # Ingestion completion percentage (0–100), updated live during processing so
+    # the admin UI can show upload/indexing progress.
+    progress: Mapped[float] = mapped_column(Float, default=0.0)
 
     status: Mapped[DocumentStatus] = mapped_column(
         Enum(DocumentStatus), default=DocumentStatus.pending, index=True

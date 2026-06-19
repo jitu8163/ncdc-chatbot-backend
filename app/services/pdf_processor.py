@@ -4,13 +4,13 @@ Designed to stream page-by-page so a 1000-page document never needs to be
 fully materialised in memory. For each page we return the text plus a best-effort
 "section" label (nearest preceding heading) used for citation references.
 
-Two extraction layers run per page (text layer only — no OCR):
+Three extraction layers run per page:
   1. Plain text from the text layer (fast, the common case).
   2. Tables detected by PyMuPDF are emitted as markdown so the row/column
      structure survives chunking (find_tables / to_markdown).
-
-Image-only pages (scans / flowcharts) carry no text layer; for this MVP they are
-simply skipped rather than OCR'd, so a purely scanned document will index no text.
+  3. OCR fallback (RapidOCR) for scanned / image-only pages whose text layer is
+     empty or sparse — the page is rendered to an image and recognised so a
+     purely scanned document still indexes its text. Toggle via settings.ocr_*.
 
 Running headers/footers that repeat across most pages are stripped so they
 don't pollute every chunk.
@@ -27,6 +27,7 @@ from functools import lru_cache
 import fitz  # PyMuPDF
 
 from app.config import settings
+from app.services import ocr
 
 logger = logging.getLogger("ncdc.pdf")
 
@@ -98,6 +99,16 @@ def _boilerplate(doc: fitz.Document) -> set[str]:
     return {key for key, n in counts.items() if n >= threshold}
 
 
+def _ocr_page(page: fitz.Page) -> str:
+    """Render a page to an image and OCR it; '' on any failure."""
+    try:
+        pix = page.get_pixmap(dpi=settings.ocr_dpi)
+        return ocr.image_to_text(pix.tobytes("png"))
+    except Exception:  # noqa: BLE001 - never let a bad page break ingestion
+        logger.exception("OCR rendering failed for page %s", page.number)
+        return ""
+
+
 def iter_pages(file_path: str) -> Iterator[PageContent]:
     """Yield page content lazily; carries the current section across pages."""
     doc = fitz.open(file_path)
@@ -135,8 +146,17 @@ def iter_pages(file_path: str) -> Iterator[PageContent]:
             parts = plain_lines + table_md
             text = "\n".join(parts).strip()
 
-            # Image-only pages (flowchart/scan) have no text layer and are skipped
-            # (no OCR in the MVP); they simply yield empty text for that page.
+            # Scanned / image-only page: the text layer is empty or sparse. Render
+            # the page and OCR it so scanned PDFs still index. Only runs on pages
+            # that need it (OCR is far slower than text extraction).
+            if settings.ocr_enabled and len(text) < settings.ocr_min_chars:
+                ocr_text = _ocr_page(page)
+                if len(ocr_text) > len(text):
+                    logger.info(
+                        "OCR recovered %s chars on page %s", len(ocr_text), index + 1
+                    )
+                    text = ocr_text
+
             yield PageContent(page_number=index + 1, text=text, section=current_section)
     finally:
         doc.close()

@@ -37,16 +37,31 @@ def process_document(document_id: str) -> None:
 
         doc.status = DocumentStatus.processing
         doc.error = None
+        doc.progress = 0.0
         db.commit()
 
         qdrant_service.ensure_collection()
 
-        # 1) Extract + chunk (streams pages internally).
-        chunks, pages = chunk_document(doc.file_path)
+        # Persist progress, but throttle DB writes: only commit when the rounded
+        # percentage actually advances (a 1000-page OCR pass shouldn't do 1000 commits).
+        last_pct = 0.0
+
+        def _set_progress(pct: float) -> None:
+            nonlocal last_pct
+            pct = round(min(100.0, pct), 1)
+            if pct > last_pct:
+                last_pct = pct
+                doc.progress = pct
+                db.commit()
+
+        # 1) Extract + chunk (streams pages internally) — first half of progress.
+        chunks, pages = chunk_document(
+            doc.file_path, progress_cb=lambda p: _set_progress(p * 0.5)
+        )
         if not chunks:
             raise ValueError("No extractable text found in document (scanned PDF?).")
 
-        # 2) Embed + index in batches to bound memory and API payload size.
+        # 2) Embed + index in batches — second half of progress (50→100%).
         total = 0
         for batch in _batched(chunks, settings.embed_batch_size):
             texts = [c.text for c in batch]
@@ -60,10 +75,12 @@ def process_document(document_id: str) -> None:
                 dense_vectors=dense,
             )
             total += len(batch)
+            _set_progress(50.0 + total / len(chunks) * 50.0)
             logger.info("Indexed %s/%s chunks for %s", total, len(chunks), doc.id)
 
         doc.page_count = pages
         doc.chunk_count = total
+        doc.progress = 100.0
         doc.status = DocumentStatus.indexed if doc.enabled else DocumentStatus.disabled
         doc.indexed_at = datetime.utcnow()
         db.commit()

@@ -28,8 +28,10 @@ dependencies = [
     "qdrant-client>=1.12.0",
     "fastembed>=0.4.2",                     # dense ONNX embeddings (MiniLM)
     "tiktoken>=0.8.0",
-    # PDF processing (text layer only — no OCR)
+    # PDF processing + OCR fallback for scanned pages (RapidOCR = ONNX, no system
+    # Tesseract binary required)
     "pymupdf>=1.24.0",
+    "rapidocr-onnxruntime>=1.3.0",
 ]
 
 [dependency-groups]
