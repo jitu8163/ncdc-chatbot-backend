@@ -57,10 +57,9 @@ def ensure_collection() -> None:
         # Keep raw vectors on disk; HNSW graph + payload index stay in RAM.
         on_disk_payload=True,
     )
-    for field in ("document_id", "category"):
-        client.create_payload_index(
-            settings.qdrant_collection, field, models.PayloadSchemaType.KEYWORD
-        )
+    client.create_payload_index(
+        settings.qdrant_collection, "document_id", models.PayloadSchemaType.KEYWORD
+    )
     client.create_payload_index(
         settings.qdrant_collection, "enabled", models.PayloadSchemaType.BOOL
     )
@@ -73,7 +72,6 @@ def _point_id(document_id: str, ordinal: int) -> str:
 def upsert_chunks(
     document_id: str,
     document_title: str,
-    category: str | None,
     enabled: bool,
     chunks: list[Chunk],
     dense_vectors: list[list[float]],
@@ -87,7 +85,6 @@ def upsert_chunks(
                 payload={
                     "document_id": document_id,
                     "document_title": document_title,
-                    "category": category,
                     "enabled": enabled,
                     "page": chunk.page,
                     "section": chunk.section,
@@ -122,26 +119,22 @@ def _doc_filter(document_id: str) -> models.Filter:
     )
 
 
-def _search_filter(category: str | None) -> models.Filter:
-    must = [models.FieldCondition(key="enabled", match=models.MatchValue(value=True))]
-    if category:
-        must.append(
-            models.FieldCondition(key="category", match=models.MatchValue(value=category))
-        )
-    return models.Filter(must=must)
+def _search_filter() -> models.Filter:
+    return models.Filter(
+        must=[models.FieldCondition(key="enabled", match=models.MatchValue(value=True))]
+    )
 
 
 def search(
     dense_vector: list[float],
     limit: int,
-    category: str | None = None,
 ) -> list[dict]:
     """Plain dense vector search.
 
     Returns a list of payload dicts augmented with the retrieval `score`.
     """
     client = get_client()
-    flt = _search_filter(category)
+    flt = _search_filter()
 
     result = client.query_points(
         collection_name=settings.qdrant_collection,

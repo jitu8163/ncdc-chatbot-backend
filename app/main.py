@@ -13,7 +13,7 @@ from app.database import Base, SessionLocal, engine
 from app.models import User, UserRole
 from app.routers import analytics, auth, chat, documents
 from app.security import hash_password
-from app.services import embeddings, ocr, qdrant_service
+from app.services import embeddings, ocr, qdrant_service, reranker
 
 logging.basicConfig(
     level=getattr(logging, settings.log_level.upper(), logging.INFO),
@@ -62,6 +62,11 @@ def _warmup_models() -> None:
         logger.info("OCR model warmed up")
     except Exception:  # noqa: BLE001
         logger.exception("OCR warmup failed (will load lazily on first scanned page)")
+    try:
+        reranker.warmup()
+        logger.info("Reranker model warmed up")
+    except Exception:  # noqa: BLE001
+        logger.exception("Reranker warmup failed (will load lazily on first query)")
 
 
 @asynccontextmanager

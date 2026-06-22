@@ -56,7 +56,6 @@ def chitchat_node(state: ChatState) -> ChatState:
         "passages": [],
         "sources_used": [],
         "citations": [],
-        "followups": [],
     }
 
 
@@ -65,7 +64,7 @@ def rewrite_node(state: ChatState) -> ChatState:
 
 
 def retrieve_node(state: ChatState) -> ChatState:
-    passages = retrieval.retrieve(state["search_query"], category=state.get("category"))
+    passages = retrieval.retrieve(state["search_query"])
     return {"passages": passages}
 
 
@@ -90,9 +89,12 @@ def generate_node(state: ChatState) -> ChatState:
         "answer": result["answer"],
         "answered": result["answered"],
         "sources_used": result["sources_used"],
-        "followups": result["followups"],
     }
-    cache.set_json("ans", out, settings.answer_cache_ttl, *_answer_signature(state))
+    if result.get("error"):
+        out["error"] = True
+    # Don't cache failed generations — we want a retry to re-attempt.
+    if not result.get("error"):
+        cache.set_json("ans", out, settings.answer_cache_ttl, *_answer_signature(state))
     return out
 
 
@@ -132,12 +134,6 @@ def citations_node(state: ChatState) -> ChatState:
     return {"citations": build_citations(state["passages"], state.get("sources_used", []))}
 
 
-def format_node(state: ChatState) -> ChatState:
-    # Final shaping: keep at most 3 follow-ups; drop them when no answer was found.
-    followups = state.get("followups", [])[:3] if state.get("answered") else []
-    return {"followups": followups}
-
-
 def _route(state: ChatState) -> str:
     return state.get("route", "question")
 
@@ -152,7 +148,6 @@ def _graph():
     g.add_node("retrieve", _timed(retrieve_node))
     g.add_node("generate", _timed(generate_node))
     g.add_node("citations", _timed(citations_node))
-    g.add_node("format", _timed(format_node))
 
     g.add_edge(START, "classify")
     g.add_conditional_edges(
@@ -162,8 +157,7 @@ def _graph():
     g.add_edge("rewrite", "retrieve")
     g.add_edge("retrieve", "generate")
     g.add_edge("generate", "citations")
-    g.add_edge("citations", "format")
-    g.add_edge("format", END)
+    g.add_edge("citations", END)
     return g.compile()
 
 
@@ -171,14 +165,12 @@ def run_chat(
     question: str,
     history: list[dict] | None = None,
     language: str | None = None,
-    category: str | None = None,
 ) -> ChatState:
     """Execute the chat graph and return the final state."""
     initial: ChatState = {
         "question": question,
         "history": history or [],
         "language": language,
-        "category": category,
     }
     start = time.perf_counter()
     result = _graph().invoke(initial)

@@ -10,12 +10,13 @@ from fastapi import APIRouter, Depends
 
 from app.database import get_db
 from app.deps import require_admin
-from app.models import AuditLog, Document, Feedback, QueryLog, User
+from app.models import AuditLog, ChatMessage, Document, Feedback, QueryLog, User
 from app.schemas import (
     AnalyticsSummary,
     DailyUsageItem,
     DocUsageItem,
     FAQItem,
+    FeedbackEntry,
 )
 
 router = APIRouter(prefix="/api/analytics", tags=["analytics"])
@@ -82,6 +83,57 @@ def summary(days: int = 30, db: Session = Depends(get_db), _: User = Depends(req
         feedback_positive=int(pos),
         feedback_negative=int(neg),
     )
+
+
+@router.get("/feedback", response_model=list[FeedbackEntry])
+def feedback_log(
+    rating: int | None = None,
+    limit: int = 200,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_admin),
+):
+    """List feedback the way an admin needs to review it: each thumbs up/down
+    paired with the answer it was given on and the question that produced it.
+
+    `rating` filters to positive (1) or negative (-1) only.
+    """
+    q = db.query(Feedback).order_by(Feedback.created_at.desc())
+    if rating is not None:
+        q = q.filter(Feedback.rating == rating)
+    rows = q.limit(limit).all()
+
+    entries: list[FeedbackEntry] = []
+    for fb in rows:
+        answer_msg = db.get(ChatMessage, fb.message_id)
+        question = None
+        answer = ""
+        if answer_msg is not None:
+            answer = answer_msg.content
+            # The question is the most recent user turn before this answer.
+            prev = (
+                db.query(ChatMessage)
+                .filter(
+                    ChatMessage.session_id == answer_msg.session_id,
+                    ChatMessage.role == "user",
+                    ChatMessage.created_at <= answer_msg.created_at,
+                    ChatMessage.id != answer_msg.id,
+                )
+                .order_by(ChatMessage.created_at.desc())
+                .first()
+            )
+            if prev is not None:
+                question = prev.content
+        entries.append(
+            FeedbackEntry(
+                id=fb.id,
+                rating=fb.rating,
+                question=question,
+                answer=answer,
+                comment=fb.comment,
+                created_at=fb.created_at.isoformat() if fb.created_at else None,
+            )
+        )
+    return entries
 
 
 @router.get("/audit-logs")

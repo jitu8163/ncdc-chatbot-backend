@@ -69,7 +69,6 @@ def process_document(document_id: str) -> None:
             qdrant_service.upsert_chunks(
                 document_id=doc.id,
                 document_title=doc.title,
-                category=doc.category,
                 enabled=doc.enabled,
                 chunks=batch,
                 dense_vectors=dense,

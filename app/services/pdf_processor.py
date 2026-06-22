@@ -181,3 +181,18 @@ def page_count(file_path: str) -> int:
         return doc.page_count
     finally:
         doc.close()
+
+
+def page_text(file_path: str, page_number: int) -> tuple[str, str | None]:
+    """Return (text, section) for one 1-based page, using the same extraction the
+    ingestion pipeline used — so a citation's snippet is a substring of this text
+    and can be highlighted exactly in the source viewer. ("", None) if not found.
+    """
+    if page_number < 1:
+        return "", None
+    for pc in iter_pages(file_path):
+        if pc.page_number == page_number:
+            return pc.text, pc.section
+        if pc.page_number > page_number:
+            break
+    return "", None

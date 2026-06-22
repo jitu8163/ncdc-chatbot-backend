@@ -56,7 +56,6 @@ class Document(Base):
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
     title: Mapped[str] = mapped_column(String(512), index=True)
     original_filename: Mapped[str] = mapped_column(String(512))
-    category: Mapped[str | None] = mapped_column(String(128), index=True, nullable=True)
     version: Mapped[int] = mapped_column(Integer, default=1)
     # If this document replaces an older one, point back to it for version history.
     replaces_id: Mapped[str | None] = mapped_column(

@@ -21,6 +21,14 @@ NO_INFO_MESSAGE = (
     "Relevant information could not be found in the available NCDC guideline documents."
 )
 
+# Shown when the language model itself can't be reached (rate limit, timeout,
+# provider error) — distinct from NO_INFO_MESSAGE so we don't blame the documents
+# for an infrastructure problem.
+SERVICE_BUSY_MESSAGE = (
+    "The assistant is temporarily unavailable (the language model is rate-limited or "
+    "unreachable). Please try again in a little while."
+)
+
 _client: OpenAI | None = None
 
 
@@ -44,28 +52,63 @@ SYSTEM_PROMPT = f"""You are the NCDC Guideline Assistant. You help citizens and 
 healthcare workers understand National Centre for Disease Control (NCDC) guideline \
 documents.
 
-STRICT RULES:
-1. Answer ONLY using the numbered SOURCES provided in the user message. Never use \
-outside or prior knowledge.
-2. If the sources do not contain enough information to answer, you MUST set \
-"answered" to false and set "answer" to exactly this string:
+RULES:
+1. Ground factual claims about the guidelines in the numbered SOURCES provided in \
+the user message — do not invent guideline facts. Within the sources, you SHOULD \
+synthesize, summarize and paraphrase across passages; you do not need a word-for-word \
+match. You may ALSO use the CONVERSATION so far (the earlier questions and your own \
+earlier answers) as context.
+2. FOLLOW-UPS: When the user's latest message is a follow-up about your previous \
+answer — e.g. "are you sure?", "why?", "how?", "can you explain more?", "what do you \
+mean?", "is that correct?" — do NOT treat it as a brand-new question and do NOT reply \
+with a greeting or restate your role. Instead, use the CONVERSATION to confirm, \
+justify, clarify or expand on what you already told the user. If you answer such a \
+follow-up from the conversation rather than from the numbered sources, set \
+"sources_used" to [] and "answered" to true. Never claim the information is \
+unavailable when the conversation already contains it.
+3. Be helpful: if the sources or the conversation contain information that answers or \
+partially answers the question, give the most useful grounded answer you can and note \
+any limits. Only when NEITHER the sources NOR the conversation address the question at \
+all should you set "answered" to false and set "answer" to exactly this string:
    "{NO_INFO_MESSAGE}"
-3. You must NOT diagnose diseases, prescribe medicines, or give individual clinical \
-recommendations. You may quote what a guideline states in general terms, but add no \
+4. You must NOT diagnose diseases, prescribe medicines, or give individual clinical \
+recommendations. You may explain what a guideline states in general terms, but add no \
 personal medical advice.
-4. Reply in the SAME language as the user's question. Translate guideline content as \
+5. Reply in the SAME language as the user's question. Translate guideline content as \
 needed while preserving meaning.
-5. Cite the sources you used by their number. Only cite sources that actually support \
+6. Cite the sources you used by their number. Only cite sources that actually support \
 your answer.
-6. Be concise, factual and faithful to the guideline wording.
+7. Be concise, factual and faithful to the guideline wording.
 
 Respond ONLY with a JSON object of this exact shape:
 {{
   "answer": "<your grounded answer or the no-info string>",
   "answered": <true|false>,
-  "sources_used": [<source numbers you relied on>],
-  "followups": ["<up to 3 relevant follow-up questions in the user's language>"]
+  "sources_used": [<source numbers you relied on, or [] if answered from the conversation>]
 }}"""
+
+
+FOLLOWUP_SYSTEM_PROMPT = """You are the NCDC Guideline Assistant, continuing an \
+ongoing conversation. The user's latest message is a FOLLOW-UP about your previous \
+answer — for example confirming it ("are you sure?"), asking why or how, or asking \
+you to explain or expand.
+
+RULES:
+1. Use the CONVERSATION above as your primary context: confirm, justify, clarify or \
+expand on what you already told the user. Any SOURCES provided are supplementary.
+2. Do NOT greet the user, restate your role, or send a generic message. Do NOT say \
+the information is unavailable when the conversation already contains it.
+3. Stay faithful to what the guidelines (as reflected in the conversation and any \
+sources) actually say — do not invent new facts, and give no personal medical advice \
+(no diagnosis or prescriptions).
+4. Reply in the SAME language as the user.
+
+Respond ONLY with a JSON object of this exact shape:
+{
+  "answer": "<your answer>",
+  "answered": true,
+  "sources_used": [<source numbers you relied on, or [] if answered from the conversation>]
+}"""
 
 
 def _build_context(passages: list[dict]) -> str:
@@ -108,6 +151,34 @@ def classify_question(question: str) -> str:
     return "chitchat" if _CHITCHAT_RE.match(question or "") else "question"
 
 
+# Short "meta" follow-ups that refer to the PREVIOUS answer rather than introducing
+# a new topic. These have little/no retrievable content of their own, so they must
+# be answered from the conversation — not by running fresh retrieval and grounding
+# strictly in whatever (often irrelevant) chunks come back.
+_FOLLOWUP_RE = re.compile(
+    r"^\s*(?:"
+    r"(?:are|r)\s*(?:you|u)\s*(?:sure|certain|serious)|(?:you|u)\s*sure|sure|"
+    r"really|seriously|"
+    r"why(?:\s*(?:not|so|is\s*(?:that|this)))?|"
+    r"how(?:\s*(?:so|come|is\s*(?:that|this)))?|"
+    r"what\s*(?:do|does|du)\s*(?:you|u|that|this|it)\s*mean|"
+    r"is\s*(?:that|this|it)\s*(?:correct|right|true|sure|so)|"
+    r"(?:can|could|will)\s*(?:you|u)\s*(?:please\s*)?(?:explain|elaborate|clarify)"
+    r"(?:\s*(?:more|that|it|this))?|"
+    r"(?:please\s*)?(?:explain|elaborate|clarify)(?:\s*(?:more|that|it|this))?|"
+    r"(?:tell|give)\s*me\s*more|more\s*details?|"
+    r"go\s*on|continue|and|prove\s*it|says?\s*who"
+    r")[\s!.?]*$",
+    re.IGNORECASE,
+)
+
+
+def is_followup(question: str) -> bool:
+    """True for a short meta follow-up about the previous answer (e.g. "are you
+    sure?", "why?", "explain more"). Caller should also confirm history exists."""
+    return bool(_FOLLOWUP_RE.match(question or ""))
+
+
 def rewrite_query(question: str, history: list[dict] | None) -> str:
     """Rewrite a possibly-elliptical follow-up into a standalone search query."""
     if not history:
@@ -116,7 +187,8 @@ def rewrite_query(question: str, history: list[dict] | None) -> str:
     if not recent:
         return question
     try:
-        convo = "\n".join(f"{t['role']}: {t['content']}" for t in history[-6:])
+        window = settings.chat_history_window
+        convo = "\n".join(f"{t['role']}: {t['content']}" for t in history[-window:])
         # Tight per-call timeout: this runs *before* streaming starts, so if the
         # rewrite is slow we fall back to the original question rather than make
         # the user wait. (Handled by the except below on timeout.)
@@ -130,8 +202,13 @@ def rewrite_query(question: str, history: list[dict] | None) -> str:
                     "content": (
                         "Rewrite the user's latest message into a single, standalone "
                         "search query that resolves pronouns and references using the "
-                        "conversation. Keep the original language. Respond with JSON "
-                        '{"query": "..."}.'
+                        "conversation. If the latest message is a confirmation or "
+                        "meta follow-up (e.g. 'are you sure?', 'why?', 'how?', "
+                        "'explain more', 'what do you mean?'), build the query around "
+                        "the SPECIFIC TOPIC of the assistant's most recent answer so "
+                        "the right documents are retrieved — never output a generic "
+                        "query like 'are you sure'. Keep the original language. "
+                        'Respond with JSON {"query": "..."}.'
                     ),
                 },
                 {
@@ -147,6 +224,39 @@ def rewrite_query(question: str, history: list[dict] | None) -> str:
         return question
 
 
+def generate_title(question: str) -> str:
+    """Summarise a conversation's first message into a short, specific title.
+
+    Used once per conversation. Runs on the small/fast rewrite model with a tight
+    timeout and falls back to a trimmed version of the question on any failure, so
+    it can never block or break the chat flow.
+    """
+    fallback = re.sub(r"\s+", " ", (question or "New conversation").strip())[:60]
+    try:
+        resp = _openai().with_options(timeout=settings.rewrite_timeout).chat.completions.create(
+            model=settings.rewrite_model or settings.openai_chat_model,
+            temperature=0.0,
+            response_format={"type": "json_object"},
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "Generate a short, specific conversation title (3-6 words, "
+                        "Title Case, no surrounding quotes, no trailing punctuation) "
+                        "that summarises the user's message. Keep the original "
+                        'language. Respond with JSON {"title": "..."}.'
+                    ),
+                },
+                {"role": "user", "content": question},
+            ],
+        )
+        title = (json.loads(resp.choices[0].message.content).get("title") or "").strip()
+        return title[:60] or fallback
+    except Exception:  # noqa: BLE001
+        logger.exception("Title generation failed; using fallback")
+        return fallback
+
+
 CHITCHAT_REPLY = (
     "Hello! I'm the NCDC Guideline Assistant. Ask me anything about the NCDC "
     "guideline documents and I'll answer with citations to the source."
@@ -159,13 +269,13 @@ def generate_answer(
     history: list[dict] | None = None,
     language: str | None = None,
 ) -> dict:
-    """Return {answer, answered, sources_used: list[int], followups: list[str]}."""
+    """Return {answer, answered, sources_used: list[int]}."""
     if not passages:
-        return {"answer": NO_INFO_MESSAGE, "answered": False, "sources_used": [], "followups": []}
+        return {"answer": NO_INFO_MESSAGE, "answered": False, "sources_used": []}
 
     messages: list[dict] = [{"role": "system", "content": SYSTEM_PROMPT}]
-    # Carry recent session turns so follow-ups keep context (kept short on purpose).
-    for turn in (history or [])[-6:]:
+    # Carry recent session turns so follow-ups keep context (bounded by the window).
+    for turn in (history or [])[-settings.chat_history_window:]:
         messages.append({"role": turn["role"], "content": turn["content"]})
 
     lang_hint = f"\n\n(Respond in: {language})" if language else ""
@@ -189,17 +299,20 @@ def generate_answer(
         data = json.loads(resp.choices[0].message.content)
     except Exception:  # noqa: BLE001
         logger.exception("LLM generation failed")
-        return {"answer": NO_INFO_MESSAGE, "answered": False, "sources_used": [], "followups": []}
+        return {
+            "answer": SERVICE_BUSY_MESSAGE,
+            "answered": False,
+            "sources_used": [],
+            "error": True,
+        }
 
     answer = (data.get("answer") or "").strip() or NO_INFO_MESSAGE
     answered = bool(data.get("answered", False)) and answer != NO_INFO_MESSAGE
     sources_used = [int(s) for s in data.get("sources_used", []) if isinstance(s, (int, float))]
-    followups = [str(f) for f in data.get("followups", [])][:3]
     return {
         "answer": answer,
         "answered": answered,
         "sources_used": sources_used,
-        "followups": followups,
     }
 
 
@@ -290,45 +403,74 @@ class _AnswerFieldDecoder:
         return "".join(out)
 
 
+def _history_messages(history: list[dict] | None) -> list[dict]:
+    return [
+        {"role": t["role"], "content": t["content"]}
+        for t in (history or [])[-settings.chat_history_window:]
+    ]
+
+
 def stream_answer(
     question: str,
     passages: list[dict],
     history: list[dict] | None = None,
     language: str | None = None,
 ) -> Iterator[dict]:
-    """Stream a grounded answer.
+    """Stream a grounded answer for a (possibly first) question.
 
-    Yields:
-      {"type": "delta", "text": <answer chunk>}   — zero or more, in order
-      {"type": "final", "answer", "answered", "sources_used", "followups"}  — exactly once
-
-    The final event carries the canonical values (parsed from the complete JSON)
-    used for persistence + citations.
+    Yields zero or more {"type":"delta",...} then exactly one {"type":"final",...}.
     """
-    if not passages:
+    # Give up immediately only when there's nothing to work with at all: no
+    # retrieved passages AND no prior conversation to fall back on.
+    if not passages and not history:
         yield {
             "type": "final",
             "answer": NO_INFO_MESSAGE,
             "answered": False,
             "sources_used": [],
-            "followups": [],
         }
         return
 
-    messages: list[dict] = [{"role": "system", "content": SYSTEM_PROMPT}]
-    for turn in (history or [])[-6:]:
-        messages.append({"role": turn["role"], "content": turn["content"]})
     lang_hint = f"\n\n(Respond in: {language})" if language else ""
-    messages.append(
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        *_history_messages(history),
         {
             "role": "user",
-            "content": (
-                f"SOURCES:\n{_build_context(passages)}\n\n"
-                f"QUESTION: {question}{lang_hint}"
-            ),
-        }
-    )
+            "content": f"SOURCES:\n{_build_context(passages)}\n\nQUESTION: {question}{lang_hint}",
+        },
+    ]
+    yield from _stream_json_answer(messages)
 
+
+def stream_followup(
+    question: str,
+    passages: list[dict],
+    history: list[dict] | None = None,
+    language: str | None = None,
+) -> Iterator[dict]:
+    """Stream an answer to a conversational follow-up about the previous answer
+    ("are you sure?", "why?", "explain more"). Answers primarily from the
+    CONVERSATION (retrieval is supplementary) and never short-circuits to the
+    no-info message, so the assistant confirms/justifies/expands instead of
+    deflecting.
+    """
+    lang_hint = f"\n\n(Respond in: {language})" if language else ""
+    sources = _build_context(passages)
+    sources_block = f"SOURCES (optional, may help):\n{sources}\n\n" if sources.strip() else ""
+    messages = [
+        {"role": "system", "content": FOLLOWUP_SYSTEM_PROMPT},
+        *_history_messages(history),
+        {"role": "user", "content": f"{sources_block}FOLLOW-UP: {question}{lang_hint}"},
+    ]
+    yield from _stream_json_answer(messages)
+
+
+def _stream_json_answer(messages: list[dict]) -> Iterator[dict]:
+    """Stream one grounded-answer completion from `messages`: zero or more delta
+    events, then exactly one final event {answer, answered, sources_used[, error]}.
+    Shared by stream_answer and stream_followup.
+    """
     decoder = _AnswerFieldDecoder()
     raw_parts: list[str] = []
     shown_parts: list[str] = []
@@ -360,10 +502,10 @@ def stream_answer(
         logger.exception("LLM streaming generation failed")
         yield {
             "type": "final",
-            "answer": NO_INFO_MESSAGE,
+            "answer": SERVICE_BUSY_MESSAGE,
             "answered": False,
             "sources_used": [],
-            "followups": [],
+            "error": True,
         }
         return
 
@@ -376,11 +518,9 @@ def stream_answer(
     answer = (data.get("answer") or "").strip() or streamed or NO_INFO_MESSAGE
     answered = bool(data.get("answered", False)) and answer != NO_INFO_MESSAGE
     sources_used = [int(s) for s in data.get("sources_used", []) if isinstance(s, (int, float))]
-    followups = [str(f) for f in data.get("followups", [])][:3]
     yield {
         "type": "final",
         "answer": answer,
         "answered": answered,
         "sources_used": sources_used,
-        "followups": followups,
     }

@@ -8,7 +8,6 @@ class ChatState(TypedDict, total=False):
     # Inputs
     question: str
     language: str | None
-    category: str | None
     history: list[dict]            # [{role, content}, ...] prior turns
 
     # Working values
@@ -21,4 +20,4 @@ class ChatState(TypedDict, total=False):
     answered: bool
     sources_used: list[int]
     citations: list[dict]
-    followups: list[str]
+    error: bool

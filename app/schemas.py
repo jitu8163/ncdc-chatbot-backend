@@ -36,7 +36,6 @@ class DocumentOut(BaseModel):
     id: str
     title: str
     original_filename: str
-    category: str | None
     version: int
     status: DocumentStatus
     enabled: bool
@@ -51,8 +50,16 @@ class DocumentOut(BaseModel):
 
 class DocumentUpdate(BaseModel):
     title: str | None = None
-    category: str | None = None
     enabled: bool | None = None
+
+
+class DocumentPage(BaseModel):
+    """Full extracted text of a single page, for the in-app source viewer."""
+    document_id: str
+    document_title: str
+    page: int | None
+    section: str | None
+    text: str
 
 
 # ─── Chat ──────────────────────────────────────────────────────────────
@@ -74,17 +81,34 @@ class Citation(BaseModel):
 class ChatResponse(BaseModel):
     session_id: str
     message_id: str
+    title: str | None = None
     answer: str
     answered: bool
     citations: list[Citation] = []
-    followups: list[str] = []
     latency_ms: int = 0
+
+
+class ChatSessionSummary(BaseModel):
+    """One conversation in a user's history list."""
+    id: str
+    title: str | None
+    created_at: str | None
 
 
 class FeedbackIn(BaseModel):
     message_id: str
     rating: int = Field(ge=-1, le=1)
     comment: str | None = None
+
+
+class FeedbackEntry(BaseModel):
+    """One feedback record paired with the question and answer it refers to."""
+    id: str
+    rating: int
+    question: str | None
+    answer: str
+    comment: str | None
+    created_at: str | None
 
 
 # ─── Analytics ─────────────────────────────────────────────────────────

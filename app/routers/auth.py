@@ -14,6 +14,26 @@ from app.security import create_access_token, hash_password, verify_password
 router = APIRouter(prefix="/api/auth", tags=["auth"])
 
 
+@router.post("/register", response_model=Token, status_code=status.HTTP_201_CREATED)
+def register(payload: UserCreate, db: Session = Depends(get_db)):
+    """Public self-registration. Always creates a plain `user` account (the
+    requested role is ignored) and returns a token so the client is logged in
+    immediately. Admin accounts can only be created by another admin."""
+    if db.query(User).filter(User.email == payload.email).first():
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Email already exists")
+    user = User(
+        email=payload.email,
+        full_name=payload.full_name,
+        role=UserRole.user,
+        hashed_password=hash_password(payload.password),
+    )
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    token = create_access_token(subject=user.id, role=user.role.value)
+    return Token(access_token=token)
+
+
 @router.post("/login", response_model=Token)
 def login(form: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
     # OAuth2 form uses `username`; we treat it as the email.

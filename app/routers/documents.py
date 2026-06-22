@@ -20,10 +20,10 @@ from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.database import get_db
-from app.deps import require_admin
+from app.deps import get_current_user, require_admin
 from app.models import AuditLog, Document, DocumentStatus, User
-from app.schemas import DocumentOut, DocumentUpdate
-from app.services import ingestion, qdrant_service
+from app.schemas import DocumentOut, DocumentPage, DocumentUpdate
+from app.services import cache, ingestion, pdf_processor, qdrant_service
 
 router = APIRouter(prefix="/api/documents", tags=["documents"])
 
@@ -38,14 +38,17 @@ def _audit(db: Session, user_id: str | None, action: str, target: str, detail: s
 async def upload_document(
     background: BackgroundTasks,
     file: UploadFile = File(...),
-    title: str | None = Form(None),
-    category: str | None = Form(None),
+    title: str = Form(...),
     replaces_id: str | None = Form(None),
     db: Session = Depends(get_db),
     admin: User = Depends(require_admin),
 ):
     if file.content_type not in ALLOWED_CONTENT_TYPES:
         raise HTTPException(status_code=415, detail="Only PDF documents are supported.")
+
+    title = title.strip()
+    if not title:
+        raise HTTPException(status_code=422, detail="A title is required for every document.")
 
     os.makedirs(settings.upload_dir, exist_ok=True)
     doc_id = uuid.uuid4().hex
@@ -68,9 +71,8 @@ async def upload_document(
 
     doc = Document(
         id=doc_id,
-        title=title or os.path.splitext(file.filename or safe_name)[0],
+        title=title,
         original_filename=file.filename or safe_name,
-        category=category,
         file_path=dest,
         checksum=hasher.hexdigest(),
         file_size=size,
@@ -101,21 +103,12 @@ async def upload_document(
 def list_documents(
     db: Session = Depends(get_db),
     _: User = Depends(require_admin),
-    category: str | None = None,
     status_filter: DocumentStatus | None = None,
 ):
     q = db.query(Document)
-    if category:
-        q = q.filter(Document.category == category)
     if status_filter:
         q = q.filter(Document.status == status_filter)
     return q.order_by(Document.created_at.desc()).all()
-
-
-@router.get("/categories", response_model=list[str])
-def list_categories(db: Session = Depends(get_db), _: User = Depends(require_admin)):
-    rows = db.query(Document.category).distinct().all()
-    return sorted({r[0] for r in rows if r[0]})
 
 
 @router.get("/{document_id}", response_model=DocumentOut)
@@ -139,8 +132,6 @@ def update_document(
 
     if payload.title is not None:
         doc.title = payload.title
-    if payload.category is not None:
-        doc.category = payload.category
     if payload.enabled is not None and payload.enabled != doc.enabled:
         doc.enabled = payload.enabled
         # Toggle visibility in Qdrant without re-embedding.
@@ -191,6 +182,36 @@ def delete_document(
     _audit(db, admin.id, "document.delete", doc.id, doc.title)
     db.delete(doc)
     db.commit()
+
+
+@router.get("/{document_id}/page/{page}", response_model=DocumentPage)
+def get_page_text(
+    document_id: str,
+    page: int,
+    db: Session = Depends(get_db),
+    _: User = Depends(get_current_user),
+):
+    """Full extracted text of one page, for the in-app source viewer (any signed-in
+    user). The citation snippet is a substring of this text, so the frontend can
+    highlight the relevant lines within the complete page. Cached per page."""
+    doc = db.get(Document, document_id)
+    if not doc or not doc.file_path or not os.path.exists(doc.file_path):
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    cached = cache.get_json("page", document_id, str(page))
+    if cached is not None:
+        return DocumentPage(**cached)
+
+    text, section = pdf_processor.page_text(doc.file_path, page)
+    result = DocumentPage(
+        document_id=document_id,
+        document_title=doc.title,
+        page=page,
+        section=section,
+        text=text,
+    )
+    cache.set_json("page", result.model_dump(), settings.retrieval_cache_ttl, document_id, str(page))
+    return result
 
 
 @router.get("/{document_id}/view")

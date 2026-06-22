@@ -50,7 +50,7 @@ class Settings(BaseSettings):
     # Groq key. Leave openai_base_url empty to use OpenAI (gpt-4o-mini) instead.
     openai_api_key: str = ""
     openai_base_url: str | None = "https://api.groq.com/openai/v1"
-    openai_chat_model: str = "llama-3.3-70b-versatile"
+    openai_chat_model: str = "llama-3.1-8b-instant"
     # Follow-up query rewrite runs *before* streaming starts, so it uses a small,
     # fast model (the task is trivial) to keep time-to-first-token low. Falls back
     # to openai_chat_model if left blank.
@@ -62,15 +62,35 @@ class Settings(BaseSettings):
     llm_request_timeout: float = 12.0
     rewrite_timeout: float = 1.5
 
+    # Multi-turn memory: how many of the most recent conversation messages (user +
+    # assistant turns combined) are loaded as context for follow-up rewriting and
+    # answer generation. ~16 ≈ the last 8 exchanges — enough for "Why?"/"Are you
+    # sure?" follow-ups without bloating the prompt or latency.
+    chat_history_window: int = 16
+
+    # Paced streaming: artificial delay (seconds) inserted between word chunks sent
+    # to the client so the answer is visibly typed out rather than appearing at the
+    # model's full speed. ~0.04s ≈ a steady "medium" reveal. Set to 0 to disable.
+    stream_word_delay: float = 0.04
+
     # Embeddings — small multilingual ONNX bi-encoder via FastEmbed (CPU-friendly).
     # 384-dim. Changing this model requires re-indexing the corpus.
     embedding_model: str = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
     embedding_dim: int = 384
     embed_device: str = "cpu"           # unused by the ONNX path; kept for compatibility
 
-    # Retrieval (MVP: plain dense vector search — no BM25 hybrid, no reranker)
-    retrieve_top_k: int = 15   # candidates pulled from Qdrant
+    # Retrieval — dense vector search, then a cross-encoder reranker sharpens the
+    # final ordering. retrieve_top_k is the wide candidate set fed to the reranker;
+    # final_top_k is what survives and goes to the LLM.
+    retrieve_top_k: int = 30   # candidates pulled from Qdrant (reranker input)
     final_top_k: int = 6       # passages kept and sent to the LLM
+
+    # Cross-encoder reranking. Scores each (query, passage) pair jointly — far more
+    # accurate than raw vector distance. Runs on CPU via FastEmbed ONNX in ~tens of
+    # ms for ~30 candidates, negligible next to LLM generation. Set
+    # reranker_enabled=false to fall back to plain dense order.
+    reranker_enabled: bool = True
+    reranker_model: str = "Xenova/ms-marco-MiniLM-L-6-v2"
 
     # PDF extraction
     # Tables are pulled out as markdown (PyMuPDF find_tables) so the row/column
