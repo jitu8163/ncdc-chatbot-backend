@@ -136,30 +136,54 @@ def _build_context(passages: list[dict]) -> str:
     return "\n\n".join(blocks)
 
 
-# Greetings / thanks / smalltalk with no information need. Matched locally so we
-# don't spend a network round-trip (and ~1s) classifying every turn. Deliberately
-# conservative: anything that isn't an obvious pleasantry falls through to
-# "question" and goes through retrieval, so we never skip docs for a real need.
-_CHITCHAT_RE = re.compile(
-    r"^\s*(?:"
-    r"hi+|hey+|hello+|hiya|yo|sup|"
-    r"good\s*(?:morning|afternoon|evening|day)|greetings|"
-    r"thanks?(?:\s*you)?|thank\s*you|thx|ty|cheers|"
-    r"bye+|goodbye|see\s*you|see\s*ya|cya|"
-    r"ok(?:ay)?|cool|nice|great|awesome|got\s*it|"
-    r"how\s*are\s*you|who\s*are\s*you|what\s*can\s*you\s*do"
-    r")[\s!.?]*$",
-    re.IGNORECASE,
-)
+# Smalltalk with no information need, split by INTENT so each gets an appropriate
+# reply instead of the same canned greeting. Matched locally (no LLM round-trip)
+# and deliberately conservative: anything that isn't an obvious pleasantry falls
+# through to the LLM router, so we never skip docs for a real need.
+_SMALLTALK_RES: list[tuple[str, re.Pattern]] = [
+    # Acknowledgements: "ok", "okay", "got it", "cool", "makes sense" — a brief
+    # nod, NOT a reason to re-introduce the assistant.
+    ("ack", re.compile(
+        r"^\s*(?:ok(?:ay)?|kk?|cool|nice|great|awesome|good|fine|alright|"
+        r"got\s*it|understood|makes\s*sense|sounds\s*good|noted|perfect|"
+        r"wonderful|excellent|right|i\s*see|gotcha|thumbs\s*up|👍)[\s!.?]*$",
+        re.IGNORECASE)),
+    # Thanks.
+    ("thanks", re.compile(
+        r"^\s*(?:thanks?(?:\s*(?:you|a\s*lot|so\s*much))?|thank\s*(?:you|u)|thx|ty|"
+        r"much\s*appreciated|appreciate\s*it|cheers)[\s!.?]*$",
+        re.IGNORECASE)),
+    # Farewells.
+    ("bye", re.compile(
+        r"^\s*(?:bye+|goodbye|see\s*(?:you|ya)|cya|take\s*care|"
+        r"good\s*night|gn|that'?s\s*all)[\s!.?]*$",
+        re.IGNORECASE)),
+    # Greetings / who-are-you — the only case that warrants the full intro.
+    ("greeting", re.compile(
+        r"^\s*(?:hi+|hey+|hello+|hiya|yo|sup|namaste|namaskar|"
+        r"good\s*(?:morning|afternoon|evening|day)|greetings|"
+        r"how\s*are\s*you|who\s*(?:are\s*you|r\s*u)|what\s*(?:can\s*you\s*do|are\s*you)|"
+        r"what\s*can\s*you\s*help(?:\s*with)?)[\s!.?]*$",
+        re.IGNORECASE)),
+]
+
+
+def classify_smalltalk(question: str) -> str | None:
+    """Return the smalltalk INTENT of a trivial non-question — one of "greeting",
+    "ack", "thanks", "bye" — or None when the turn needs real routing
+    (follow-up / knowledge lookup). Cheap local match, no LLM call."""
+    q = question or ""
+    for label, pattern in _SMALLTALK_RES:
+        if pattern.match(q):
+            return label
+    return None
 
 
 def classify_question(question: str) -> str:
-    """Classify a turn so the pipeline can skip retrieval for non-questions.
-
-    Returns "chitchat" (greeting/thanks/smalltalk) or "question". Uses a cheap
-    local pattern instead of an LLM call to keep latency down.
-    """
-    return "chitchat" if _CHITCHAT_RE.match(question or "") else "question"
+    """Coarse route for the non-streaming graph pipeline: "chitchat" for any
+    smalltalk, else "question". The streaming endpoint uses the finer
+    `classify_smalltalk` + `route_query` instead."""
+    return "chitchat" if classify_smalltalk(question) else "question"
 
 
 # Short "meta" follow-ups that refer to the PREVIOUS answer rather than introducing
@@ -227,78 +251,95 @@ def is_followup(question: str) -> bool:
     return bool(_FOLLOWUP_RE.match(q) or _FOLLOWUP_PREFIX_RE.match(q))
 
 
-def analyze_query(question: str, history: list[dict] | None) -> tuple[str, bool]:
-    """Rewrite a follow-up into a standalone search query AND classify whether it
-    is a meta follow-up about the previous answer.
+_VALID_ROUTES = {"smalltalk", "followup", "knowledge"}
 
-    Returns ``(search_query, is_followup)``. The local regex catches obvious meta
-    follow-ups instantly; the rewrite LLM call (which we make anyway) returns the
-    authoritative classification for everything else — e.g. "are you sure about
-    this?" — so we don't pay a second round-trip. The two are OR'd: either signal
-    marks it a follow-up. Falls back to ``(question, regex_result)`` on any error.
+_ROUTER_SYSTEM_PROMPT = (
+    "You are the query router for the NCDC Guideline Assistant — a RAG chatbot that "
+    "answers questions about National Centre for Disease Control (NCDC) guideline "
+    "documents. Decide how the user's LATEST message should be handled, using the "
+    "conversation for context, and return STRICT JSON.\n\n"
+    "Choose exactly one route:\n"
+    "- \"knowledge\": a NEW question whose answer must be looked up in the guideline "
+    "documents (the vector database). This is the default for any genuine "
+    "information need on a fresh topic.\n"
+    "- \"followup\": a message about the assistant's PREVIOUS answer — it asks to "
+    "confirm, justify, clarify, challenge, translate or expand what was just said, "
+    "rather than introducing a new topic. It is answered from the CONVERSATION (the "
+    "last reference), NOT by a fresh document lookup. Examples: 'are you sure?', "
+    "'are you sure about this?', 'why?', 'how so?', 'is that correct?', 'really?', "
+    "'explain more', 'what do you mean?', 'tell me more', 'what about children?', "
+    "'and for adults?', 'says who?', 'can you simplify that?'.\n"
+    "- \"smalltalk\": a greeting, thanks, acknowledgement or farewell with no "
+    "information need ('hi', 'ok', 'thanks', 'great', 'bye').\n\n"
+    "Also produce \"query\": a single standalone search query for the knowledge "
+    "base, with pronouns/references resolved from the conversation. For a followup, "
+    "build it around the SPECIFIC TOPIC of the assistant's most recent answer — "
+    "never a generic query like 'are you sure'. For smalltalk, repeat the message. "
+    "Keep the original language.\n\n"
+    'Respond ONLY with JSON: {"route": "knowledge|followup|smalltalk", "query": "..."}.'
+)
+
+
+def route_query(question: str, history: list[dict] | None) -> dict:
+    """Route a turn and produce a standalone search query.
+
+    Returns ``{"route": "smalltalk"|"followup"|"knowledge", "query": str}``.
+
+    A fast local pass settles the easy cases with no LLM call (obvious smalltalk;
+    a first turn that isn't smalltalk is always a knowledge lookup). Otherwise one
+    small/fast LLM call — the same rewrite call we already make — both classifies
+    the turn AND rewrites the query, so there is no extra round-trip. The reliable
+    local follow-up regex is OR'd in as a safety net, and we fall back to it on any
+    error. The tight `rewrite_timeout` keeps this from delaying time-to-first-token.
     """
-    q = question or ""
+    q = (question or "").strip()
+
+    smalltalk = classify_smalltalk(q)
+    if smalltalk:
+        return {"route": "smalltalk", "subtype": smalltalk, "query": q}
+
     regex_followup = bool(history) and is_followup(q)
     if not history:
-        return q, False
-    recent = [t for t in history if t.get("role") == "user"][-4:]
-    if not recent:
-        return q, regex_followup
+        # Nothing to follow up on — a real message on a fresh session is a lookup.
+        return {"route": "knowledge", "query": q}
+
+    window = settings.chat_history_window
+    convo = "\n".join(f"{t['role']}: {t['content']}" for t in history[-window:])
     try:
-        window = settings.chat_history_window
-        convo = "\n".join(f"{t['role']}: {t['content']}" for t in history[-window:])
-        # Tight per-call timeout: this runs *before* streaming starts, so if the
-        # rewrite is slow we fall back to the original question rather than make
-        # the user wait. (Handled by the except below on timeout.)
         resp = _openai().with_options(timeout=settings.rewrite_timeout).chat.completions.create(
             model=settings.rewrite_model or settings.openai_chat_model,
             temperature=0.0,
             response_format={"type": "json_object"},
             messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "You do two things with the user's latest message, using the "
-                        "conversation for context.\n"
-                        "1) REWRITE it into a single, standalone search query that "
-                        "resolves pronouns and references. If it is a confirmation or "
-                        "meta follow-up, build the query around the SPECIFIC TOPIC of "
-                        "the assistant's most recent answer — never output a generic "
-                        "query like 'are you sure'.\n"
-                        "2) CLASSIFY whether it is a META FOLLOW-UP about the "
-                        "assistant's previous answer — i.e. it asks to confirm, "
-                        "justify, clarify, challenge or expand that answer rather than "
-                        "introducing a new topic. Examples that ARE follow-ups: 'are "
-                        "you sure?', 'are you sure about this?', 'why?', 'how so?', "
-                        "'is that correct?', 'really?', 'explain more', 'what do you "
-                        "mean?', 'tell me more', 'what about children?', 'says who?'. "
-                        "A brand-new question on a different topic is NOT a follow-up.\n"
-                        "Keep the original language. Respond with JSON "
-                        '{"query": "...", "is_followup": true|false}.'
-                    ),
-                },
+                {"role": "system", "content": _ROUTER_SYSTEM_PROMPT},
                 {
                     "role": "user",
                     "content": f"Conversation:\n{convo}\n\nLatest message: {question}",
                 },
             ],
         )
-        data = json.loads(resp.choices[0].message.content)
-        rewritten = (data.get("query") or "").strip()
-        llm_followup = bool(data.get("is_followup", False))
-        return (rewritten or q, regex_followup or llm_followup)
+        data = json.loads(resp.choices[0].message.content) or {}
+        route = str(data.get("route", "")).strip().lower()
+        query = (data.get("query") or "").strip() or q
+        if route not in _VALID_ROUTES:
+            route = "followup" if regex_followup else "knowledge"
+        # Trust the deterministic follow-up signal over a "knowledge" misroute:
+        # the regex only fires on clearly back-referential phrasing.
+        if regex_followup and route == "knowledge":
+            route = "followup"
+        return {"route": route, "query": query}
     except Exception:  # noqa: BLE001
-        logger.exception("Query analysis failed; using original question")
-        return q, regex_followup
+        logger.exception("Query routing failed; falling back to regex signal")
+        return {"route": "followup" if regex_followup else "knowledge", "query": q}
 
 
 def rewrite_query(question: str, history: list[dict] | None) -> str:
     """Rewrite a possibly-elliptical follow-up into a standalone search query.
 
-    Thin wrapper over `analyze_query` for the non-streaming graph pipeline, which
+    Thin wrapper over `route_query` for the non-streaming graph pipeline, which
     only needs the rewritten query.
     """
-    return analyze_query(question, history)[0]
+    return route_query(question, history)["query"]
 
 
 def generate_title(question: str) -> str:
@@ -334,10 +375,32 @@ def generate_title(question: str) -> str:
         return fallback
 
 
-CHITCHAT_REPLY = (
+# Intent-specific smalltalk replies. Only a genuine greeting gets the full
+# self-introduction; acknowledgements ("ok"), thanks and farewells get a short,
+# natural reply so the assistant doesn't re-introduce itself every turn.
+GREETING_REPLY = (
     "Hello! I'm the NCDC Guideline Assistant. Ask me anything about the NCDC "
     "guideline documents and I'll answer with citations to the source."
 )
+ACK_REPLY = "Sure — let me know if there's anything else you'd like to ask about the NCDC guidelines."
+THANKS_REPLY = "You're welcome! Feel free to ask if you have any more questions about the NCDC guidelines."
+BYE_REPLY = "Goodbye! Come back anytime you have questions about the NCDC guidelines."
+
+_SMALLTALK_REPLIES = {
+    "greeting": GREETING_REPLY,
+    "ack": ACK_REPLY,
+    "thanks": THANKS_REPLY,
+    "bye": BYE_REPLY,
+}
+
+# Backwards-compatible alias for the non-streaming graph's chitchat node.
+CHITCHAT_REPLY = GREETING_REPLY
+
+
+def smalltalk_reply(subtype: str | None) -> str:
+    """Pick the reply for a smalltalk intent ("greeting"/"ack"/"thanks"/"bye").
+    Falls back to the acknowledgement reply for an unknown/None subtype."""
+    return _SMALLTALK_REPLIES.get(subtype or "", ACK_REPLY)
 
 
 def generate_answer(

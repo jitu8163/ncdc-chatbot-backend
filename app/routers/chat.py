@@ -221,8 +221,12 @@ def ask_stream(
         streamed_any = False
         logged_error = False
         try:
-            if llm.classify_question(payload.question) == "chitchat":
-                answer = llm.CHITCHAT_REPLY
+            # Fast local path: obvious smalltalk (greeting/ack/thanks/bye) gets an
+            # intent-appropriate canned reply — no LLM call, no retrieval. Crucially
+            # "ok"/"thanks" no longer trigger the full self-introduction.
+            smalltalk = llm.classify_smalltalk(payload.question)
+            if smalltalk:
+                answer = llm.smalltalk_reply(smalltalk)
                 for piece in _pace_words(_word_chunks(answer), delay):
                     yield _ndjson({"type": "delta", "text": piece})
                     streamed_any = True
@@ -230,59 +234,71 @@ def ask_stream(
             else:
                 # Tell the UI we're interpreting the question before retrieval kicks in.
                 yield _ndjson({"type": "status", "stage": "understanding"})
-                # One LLM call rewrites the query AND decides if this is a meta
-                # follow-up about the prior answer ("are you sure?", "why?", "explain
-                # that for children").
-                search_query, followup = llm.analyze_query(payload.question, history)
-                followup = followup and bool(history)
+                # The router (one small/fast LLM call) decides how to handle the turn
+                # AND rewrites the standalone search query in the same round-trip:
+                #   knowledge -> look the answer up in the vector DB
+                #   followup  -> answer from the conversation (the last reference)
+                #   smalltalk -> a pleasantry the local regex didn't catch
+                route_info = llm.route_query(payload.question, history)
+                route = route_info["route"]
+                search_query = route_info["query"]
 
-                if followup:
-                    # Meta follow-ups are answered from the CONVERSATION, not from
-                    # freshly-retrieved chunks. Skipping retrieval keeps the request
-                    # small and fast: it avoids stuffing ~6 (often irrelevant)
-                    # passages into the prompt, which otherwise bloats token usage
-                    # (→ provider rate limits / timeouts) and distracts the model
-                    # into a wrong "no information found" reply.
-                    generate = llm.stream_followup
+                if route == "smalltalk":
+                    answer = llm.smalltalk_reply(route_info.get("subtype"))
+                    for piece in _pace_words(_word_chunks(answer), delay):
+                        yield _ndjson({"type": "delta", "text": piece})
+                        streamed_any = True
+                    final = {"answer": answer, "answered": True, "sources_used": []}
+                    logger.info("chat user=%s session=%s route=smalltalk", user.id, session_id)
                 else:
-                    # Relay each retrieval stage (embedding -> retrieving ->
-                    # reranking) to the client, then collect the passages.
-                    for event in retrieval.retrieve_staged(search_query):
-                        if "stage" in event:
-                            yield _ndjson({"type": "status", "stage": event["stage"]})
-                        else:
-                            passages = event["result"]
-                    generate = llm.stream_answer
-                logger.info(
-                    "chat user=%s session=%s followup=%s query=%r rewritten=%r retrieved=%d",
-                    user.id, session_id, followup, payload.question, search_query, len(passages),
-                )
-                final_holder: list[dict] = []
+                    followup = route == "followup" and bool(history)
+                    if followup:
+                        # Meta follow-ups are answered from the CONVERSATION, not from
+                        # freshly-retrieved chunks. Skipping retrieval keeps the request
+                        # small and fast: it avoids stuffing ~6 (often irrelevant)
+                        # passages into the prompt, which otherwise bloats token usage
+                        # (→ provider rate limits / timeouts) and distracts the model
+                        # into a wrong "no information found" reply.
+                        generate = llm.stream_followup
+                    else:
+                        # Relay each retrieval stage (embedding -> retrieving ->
+                        # reranking) to the client, then collect the passages.
+                        for event in retrieval.retrieve_staged(search_query):
+                            if "stage" in event:
+                                yield _ndjson({"type": "status", "stage": event["stage"]})
+                            else:
+                                passages = event["result"]
+                        generate = llm.stream_answer
+                    logger.info(
+                        "chat user=%s session=%s route=%s query=%r rewritten=%r retrieved=%d",
+                        user.id, session_id, route, payload.question, search_query, len(passages),
+                    )
+                    final_holder: list[dict] = []
 
-                # Last stage before tokens start arriving.
-                yield _ndjson({"type": "status", "stage": "generating"})
+                    # Last stage before tokens start arriving.
+                    yield _ndjson({"type": "status", "stage": "generating"})
 
-                def text_deltas() -> Iterator[str]:
-                    for event in generate(
-                        question=payload.question,
-                        passages=passages,
-                        history=history,
-                        language=payload.language,
-                    ):
-                        if event["type"] == "delta":
-                            yield event["text"]
-                        else:
-                            final_holder.append(event)
+                    def text_deltas() -> Iterator[str]:
+                        for event in generate(
+                            question=payload.question,
+                            passages=passages,
+                            history=history,
+                            language=payload.language,
+                        ):
+                            if event["type"] == "delta":
+                                yield event["text"]
+                            else:
+                                final_holder.append(event)
 
-                for piece in _pace_words(text_deltas(), delay):
-                    yield _ndjson({"type": "delta", "text": piece})
-                    streamed_any = True
+                    for piece in _pace_words(text_deltas(), delay):
+                        yield _ndjson({"type": "delta", "text": piece})
+                        streamed_any = True
 
-                final = final_holder[0] if final_holder else {
-                    "answer": llm.NO_INFO_MESSAGE,
-                    "answered": False,
-                    "sources_used": [],
-                }
+                    final = final_holder[0] if final_holder else {
+                        "answer": llm.NO_INFO_MESSAGE,
+                        "answered": False,
+                        "sources_used": [],
+                    }
         except Exception as exc:  # noqa: BLE001 - never leak a 500 mid-stream
             error_log.log_error(
                 payload.question,
