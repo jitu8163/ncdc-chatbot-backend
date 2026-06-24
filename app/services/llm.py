@@ -9,13 +9,24 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
 from collections.abc import Iterator
 
-from openai import OpenAI
+from openai import (
+    APIConnectionError,
+    APITimeoutError,
+    InternalServerError,
+    OpenAI,
+    RateLimitError,
+)
 
 from app.config import settings
 
 logger = logging.getLogger(__name__)
+
+# Transient provider failures worth one quick retry before giving up (Groq's free
+# tier 429-rate-limits and occasionally times out under bursty testing).
+_RETRYABLE_ERRORS = (RateLimitError, APITimeoutError, APIConnectionError, InternalServerError)
 
 NO_INFO_MESSAGE = (
     "Relevant information could not be found in the available NCDC guideline documents."
@@ -173,19 +184,66 @@ _FOLLOWUP_RE = re.compile(
 )
 
 
+# Referential follow-up *openers* that may carry trailing context, e.g.
+# "explain that for children", "tell me more about the dosage", "what about
+# pregnant women", "why is that the case for infants". Unlike _FOLLOWUP_RE these
+# are not end-anchored: they point back at the previous answer, so extra words
+# after the trigger don't make them a brand-new question. Kept deliberately to
+# explicitly back-referential phrasings so genuine standalone questions ("why do
+# measles spread?") still go through normal retrieval.
+_FOLLOWUP_PREFIX_RE = re.compile(
+    r"^\s*(?:"
+    # confirmations, possibly trailing: "are you sure about this", "you sure?"
+    r"(?:are|r)\s*(?:you|u)\s*(?:really\s*)?(?:sure|certain|serious|positive)\b|"
+    r"(?:you|u)\s*(?:sure|certain)\b|"
+    # "is that correct ...", "is this accurate for adults", "was it right"
+    r"(?:is|are|was|were|isn'?t)\s*(?:that|this|it|these|those)\s*"
+    r"(?:correct|right|true|accurate|sure|so|real)\b|"
+    # explain / elaborate / clarify / expand / rephrase / summarise
+    r"(?:can|could|would|will)?\s*(?:you|u)?\s*(?:please\s*)?"
+    r"(?:explain|elaborate|clarify|expand|rephrase|summari[sz]e)\b|"
+    # "tell me more", "give me more details"
+    r"(?:tell|give)\s*(?:me\s*)?(?:some\s*)?more\b|"
+    # "what about X", "how about X"
+    r"(?:what|how)\s*about\b|"
+    # "what do you mean ..."
+    r"what\s*(?:do|does|did)\s*(?:you|that|this|it)\s*mean\b|"
+    # referential why/how: "why is that ...", "how does this work"
+    r"(?:why|how)\s*(?:is|are|was|were|does|do|did|come|so)?\s*"
+    r"(?:that|this|it|these|those|they)\b|"
+    # challenges to the prior answer
+    r"says?\s*who\b|prove\s*it\b|according\s*to\s*(?:what|whom|who)\b"
+    r")",
+    re.IGNORECASE,
+)
+
+
 def is_followup(question: str) -> bool:
-    """True for a short meta follow-up about the previous answer (e.g. "are you
-    sure?", "why?", "explain more"). Caller should also confirm history exists."""
-    return bool(_FOLLOWUP_RE.match(question or ""))
+    """True for a meta follow-up about the previous answer — either a bare phrase
+    ("are you sure?", "why?", "explain more") or a back-referential opener that
+    carries extra context ("explain that for children", "what about infants?").
+    Caller should also confirm history exists."""
+    q = question or ""
+    return bool(_FOLLOWUP_RE.match(q) or _FOLLOWUP_PREFIX_RE.match(q))
 
 
-def rewrite_query(question: str, history: list[dict] | None) -> str:
-    """Rewrite a possibly-elliptical follow-up into a standalone search query."""
+def analyze_query(question: str, history: list[dict] | None) -> tuple[str, bool]:
+    """Rewrite a follow-up into a standalone search query AND classify whether it
+    is a meta follow-up about the previous answer.
+
+    Returns ``(search_query, is_followup)``. The local regex catches obvious meta
+    follow-ups instantly; the rewrite LLM call (which we make anyway) returns the
+    authoritative classification for everything else — e.g. "are you sure about
+    this?" — so we don't pay a second round-trip. The two are OR'd: either signal
+    marks it a follow-up. Falls back to ``(question, regex_result)`` on any error.
+    """
+    q = question or ""
+    regex_followup = bool(history) and is_followup(q)
     if not history:
-        return question
+        return q, False
     recent = [t for t in history if t.get("role") == "user"][-4:]
     if not recent:
-        return question
+        return q, regex_followup
     try:
         window = settings.chat_history_window
         convo = "\n".join(f"{t['role']}: {t['content']}" for t in history[-window:])
@@ -200,15 +258,23 @@ def rewrite_query(question: str, history: list[dict] | None) -> str:
                 {
                     "role": "system",
                     "content": (
-                        "Rewrite the user's latest message into a single, standalone "
-                        "search query that resolves pronouns and references using the "
-                        "conversation. If the latest message is a confirmation or "
-                        "meta follow-up (e.g. 'are you sure?', 'why?', 'how?', "
-                        "'explain more', 'what do you mean?'), build the query around "
-                        "the SPECIFIC TOPIC of the assistant's most recent answer so "
-                        "the right documents are retrieved — never output a generic "
-                        "query like 'are you sure'. Keep the original language. "
-                        'Respond with JSON {"query": "..."}.'
+                        "You do two things with the user's latest message, using the "
+                        "conversation for context.\n"
+                        "1) REWRITE it into a single, standalone search query that "
+                        "resolves pronouns and references. If it is a confirmation or "
+                        "meta follow-up, build the query around the SPECIFIC TOPIC of "
+                        "the assistant's most recent answer — never output a generic "
+                        "query like 'are you sure'.\n"
+                        "2) CLASSIFY whether it is a META FOLLOW-UP about the "
+                        "assistant's previous answer — i.e. it asks to confirm, "
+                        "justify, clarify, challenge or expand that answer rather than "
+                        "introducing a new topic. Examples that ARE follow-ups: 'are "
+                        "you sure?', 'are you sure about this?', 'why?', 'how so?', "
+                        "'is that correct?', 'really?', 'explain more', 'what do you "
+                        "mean?', 'tell me more', 'what about children?', 'says who?'. "
+                        "A brand-new question on a different topic is NOT a follow-up.\n"
+                        "Keep the original language. Respond with JSON "
+                        '{"query": "...", "is_followup": true|false}.'
                     ),
                 },
                 {
@@ -217,11 +283,22 @@ def rewrite_query(question: str, history: list[dict] | None) -> str:
                 },
             ],
         )
-        rewritten = json.loads(resp.choices[0].message.content).get("query", "").strip()
-        return rewritten or question
+        data = json.loads(resp.choices[0].message.content)
+        rewritten = (data.get("query") or "").strip()
+        llm_followup = bool(data.get("is_followup", False))
+        return (rewritten or q, regex_followup or llm_followup)
     except Exception:  # noqa: BLE001
-        logger.exception("Query rewrite failed; using original question")
-        return question
+        logger.exception("Query analysis failed; using original question")
+        return q, regex_followup
+
+
+def rewrite_query(question: str, history: list[dict] | None) -> str:
+    """Rewrite a possibly-elliptical follow-up into a standalone search query.
+
+    Thin wrapper over `analyze_query` for the non-streaming graph pipeline, which
+    only needs the rewritten query.
+    """
+    return analyze_query(question, history)[0]
 
 
 def generate_title(question: str) -> str:
@@ -445,31 +522,112 @@ def stream_answer(
 
 def stream_followup(
     question: str,
-    passages: list[dict],
+    passages: list[dict] | None = None,
     history: list[dict] | None = None,
     language: str | None = None,
 ) -> Iterator[dict]:
-    """Stream an answer to a conversational follow-up about the previous answer
-    ("are you sure?", "why?", "explain more"). Answers primarily from the
-    CONVERSATION (retrieval is supplementary) and never short-circuits to the
-    no-info message, so the assistant confirms/justifies/expands instead of
+    """Answer a conversational follow-up about the previous answer ("are you
+    sure?", "why?", "explain more") from the CONVERSATION, and never short-circuit
+    to the no-info message — the assistant confirms/justifies/expands instead of
     deflecting.
+
+    Unlike `stream_answer` this uses a single non-streaming JSON-mode completion:
+    follow-up answers are short and the small chat model emits far more reliable
+    JSON when it isn't also being asked to stream. The caller (chat router) paces
+    the returned answer out word-by-word, so the UI still types it in. Yields
+    exactly one {"type": "final", ...} event.
     """
     lang_hint = f"\n\n(Respond in: {language})" if language else ""
-    sources = _build_context(passages)
+    sources = _build_context(passages or [])
     sources_block = f"SOURCES (optional, may help):\n{sources}\n\n" if sources.strip() else ""
     messages = [
         {"role": "system", "content": FOLLOWUP_SYSTEM_PROMPT},
         *_history_messages(history),
         {"role": "user", "content": f"{sources_block}FOLLOW-UP: {question}{lang_hint}"},
     ]
-    yield from _stream_json_answer(messages)
+    try:
+        resp = _create_chat_completion(messages, json_mode=True)
+        data = _loads_json_object(resp.choices[0].message.content or "") or {}
+    except Exception:  # noqa: BLE001
+        logger.exception("Follow-up generation failed")
+        yield {
+            "type": "final",
+            "answer": SERVICE_BUSY_MESSAGE,
+            "answered": False,
+            "sources_used": [],
+            "error": True,
+        }
+        return
+
+    answer = (data.get("answer") or "").strip()
+    # A follow-up should never deflect with the no-info string — it's about the
+    # conversation we already have. If the model emitted it (or nothing), fall back
+    # to a graceful re-engagement rather than blaming the documents.
+    if not answer or answer == NO_INFO_MESSAGE:
+        answer = (
+            "Let me clarify based on what I shared above — could you tell me which "
+            "part you'd like me to confirm or expand on?"
+        )
+        answered = False
+    else:
+        answered = bool(data.get("answered", True))
+    sources_used = [int(s) for s in data.get("sources_used", []) if isinstance(s, (int, float))]
+    yield {
+        "type": "final",
+        "answer": answer,
+        "answered": answered,
+        "sources_used": sources_used,
+    }
+
+
+def _create_chat_completion(messages: list[dict], *, json_mode: bool):
+    """Make a non-streaming chat completion, retrying once on a transient provider
+    error. Returns the SDK response. Used where reliable parsing matters more than
+    token-by-token streaming (e.g. short follow-up answers)."""
+    last_exc: Exception | None = None
+    kwargs: dict = {"model": settings.openai_chat_model, "messages": messages, "temperature": 0.1}
+    if json_mode:
+        kwargs["response_format"] = {"type": "json_object"}
+    for attempt in range(2):
+        try:
+            return _openai().chat.completions.create(**kwargs)
+        except _RETRYABLE_ERRORS as exc:
+            last_exc = exc
+            if attempt == 0:
+                logger.warning("LLM call transient error (%s); retrying once", type(exc).__name__)
+                time.sleep(0.8)
+    raise last_exc  # type: ignore[misc]
+
+
+def _create_chat_stream(messages: list[dict]):
+    """Open a streaming chat completion, retrying once on a transient provider
+    error (rate limit / timeout / connection / 5xx).
+
+    The retry happens before any token is consumed, so it can't duplicate output.
+    A short backoff gives a rate-limit window a moment to reset; the per-call
+    timeout still bounds the total wait.
+    """
+    last_exc: Exception | None = None
+    for attempt in range(2):
+        try:
+            return _openai().chat.completions.create(
+                model=settings.openai_chat_model,
+                messages=messages,
+                temperature=0.1,
+                stream=True,
+            )
+        except _RETRYABLE_ERRORS as exc:
+            last_exc = exc
+            if attempt == 0:
+                logger.warning("LLM stream transient error (%s); retrying once", type(exc).__name__)
+                time.sleep(0.8)
+    raise last_exc  # type: ignore[misc]
 
 
 def _stream_json_answer(messages: list[dict]) -> Iterator[dict]:
     """Stream one grounded-answer completion from `messages`: zero or more delta
     events, then exactly one final event {answer, answered, sources_used[, error]}.
-    Shared by stream_answer and stream_followup.
+    Used by stream_answer (the grounded-answer path).
     """
     decoder = _AnswerFieldDecoder()
     raw_parts: list[str] = []
@@ -481,12 +639,7 @@ def _stream_json_answer(messages: list[dict]) -> Iterator[dict]:
         # The SYSTEM_PROMPT already instructs the model to emit a JSON object, so
         # we still get well-formed JSON — just streamed token-by-token, which the
         # decoder below turns into live answer deltas.
-        stream = _openai().chat.completions.create(
-            model=settings.openai_chat_model,
-            messages=messages,
-            temperature=0.1,
-            stream=True,
-        )
+        stream = _create_chat_stream(messages)
         for chunk in stream:
             if not chunk.choices:
                 continue

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import time
+from collections.abc import Iterator
 from contextlib import contextmanager
 
 from app.config import settings
@@ -58,29 +59,50 @@ def _dedupe(passages: list[dict]) -> list[dict]:
     return out
 
 
-def retrieve(query: str) -> list[dict]:
-    """Return the best passages for a query (dense search + cross-encoder rerank)."""
+def retrieve_staged(query: str) -> Iterator[dict]:
+    """Run retrieval as a generator, surfacing each stage as it happens.
+
+    Yields ``{"stage": <name>}`` progress events ("embedding" -> "retrieving" ->
+    "reranking") as the work proceeds, then exactly one terminal
+    ``{"result": [...passages...]}``. The streaming chat endpoint relays the stage
+    events to the UI so the user sees what the pipeline is doing; a cache hit skips
+    straight to the result.
+    """
     cache_key_parts = (query,)
     cached = cache.get_json("retr", *cache_key_parts)
     if cached is not None:
         logger.info("  retrieval cache HIT")
-        return cached
+        yield {"result": cached}
+        return
 
+    yield {"stage": "embedding"}
     with _timed("embed dense"):
         dense = embeddings.embed_query(query)
 
+    yield {"stage": "retrieving"}
     with _timed("qdrant search"):
         candidates = qdrant_service.search(
             dense_vector=dense,
             limit=settings.retrieve_top_k,
         )
     if not candidates:
-        return []
+        yield {"result": []}
+        return
 
     passages = _dedupe(_to_passages(candidates))
 
+    yield {"stage": "reranking"}
     with _timed("rerank"):
         passages = reranker.rerank(query, passages, settings.final_top_k)
 
     cache.set_json("retr", passages, settings.retrieval_cache_ttl, *cache_key_parts)
+    yield {"result": passages}
+
+
+def retrieve(query: str) -> list[dict]:
+    """Return the best passages for a query (dense search + cross-encoder rerank)."""
+    passages: list[dict] = []
+    for event in retrieve_staged(query):
+        if "result" in event:
+            passages = event["result"]
     return passages

@@ -228,18 +228,39 @@ def ask_stream(
                     streamed_any = True
                 final = {"answer": answer, "answered": True, "sources_used": []}
             else:
-                search_query = llm.rewrite_query(payload.question, history)
-                passages = retrieval.retrieve(search_query)
-                # A short meta follow-up ("are you sure?", "why?") about the prior
-                # answer is answered from the conversation, not by grounding strictly
-                # in freshly-retrieved (often irrelevant) chunks.
-                followup = bool(history) and llm.is_followup(payload.question)
-                generate = llm.stream_followup if followup else llm.stream_answer
+                # Tell the UI we're interpreting the question before retrieval kicks in.
+                yield _ndjson({"type": "status", "stage": "understanding"})
+                # One LLM call rewrites the query AND decides if this is a meta
+                # follow-up about the prior answer ("are you sure?", "why?", "explain
+                # that for children").
+                search_query, followup = llm.analyze_query(payload.question, history)
+                followup = followup and bool(history)
+
+                if followup:
+                    # Meta follow-ups are answered from the CONVERSATION, not from
+                    # freshly-retrieved chunks. Skipping retrieval keeps the request
+                    # small and fast: it avoids stuffing ~6 (often irrelevant)
+                    # passages into the prompt, which otherwise bloats token usage
+                    # (→ provider rate limits / timeouts) and distracts the model
+                    # into a wrong "no information found" reply.
+                    generate = llm.stream_followup
+                else:
+                    # Relay each retrieval stage (embedding -> retrieving ->
+                    # reranking) to the client, then collect the passages.
+                    for event in retrieval.retrieve_staged(search_query):
+                        if "stage" in event:
+                            yield _ndjson({"type": "status", "stage": event["stage"]})
+                        else:
+                            passages = event["result"]
+                    generate = llm.stream_answer
                 logger.info(
                     "chat user=%s session=%s followup=%s query=%r rewritten=%r retrieved=%d",
                     user.id, session_id, followup, payload.question, search_query, len(passages),
                 )
                 final_holder: list[dict] = []
+
+                # Last stage before tokens start arriving.
+                yield _ndjson({"type": "status", "stage": "generating"})
 
                 def text_deltas() -> Iterator[str]:
                     for event in generate(
