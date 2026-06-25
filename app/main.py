@@ -89,10 +89,11 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# CORS — tighten allow_origins to the deployed frontend domain in production.
+# CORS — origins come from settings.cors_origins (env: CORS_ORIGINS). Defaults to
+# "*" for local dev; set to the deployed frontend domain(s) in production.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=settings.cors_origins_list,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

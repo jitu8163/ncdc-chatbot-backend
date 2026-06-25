@@ -17,8 +17,8 @@ env/
 # ─── Secrets & local config ────────────────────────────────────────────
 # .env holds real API keys / passwords — never commit it. The template
 # (.env.example) IS committed so others know which variables to set.
-.env
-.env.*
+# `.env*` also catches stray copies like .env1, .env.bak, .env.local.
+.env*
 !.env.example
 
 # ─── Local data & runtime artifacts ────────────────────────────────────

@@ -61,6 +61,24 @@ def set_json(namespace: str, value: Any, ttl: int, *parts: str) -> None:
         pass
 
 
+def incr_anon_messages(client_id: str, ttl: int = 86400) -> int | None:
+    """Increment and return an anonymous client's message count over a rolling 24h
+    window. Used to gate not-signed-in visitors to a small free allowance before
+    requiring login. Returns None when Redis is unavailable (the gate then can't be
+    enforced server-side — the frontend still gates locally)."""
+    client = _redis()
+    if client is None:
+        return None
+    try:
+        key = f"ncdc:anon:{client_id}"
+        count = client.incr(key)
+        if count == 1:
+            client.expire(key, ttl)
+        return count
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def rate_limited(client_id: str) -> bool:
     """Fixed-window per-minute limiter. Returns True if the caller is over quota."""
     if not settings.rate_limit_enabled:

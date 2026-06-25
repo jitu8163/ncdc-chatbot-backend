@@ -16,9 +16,10 @@ ENV PYTHONUNBUFFERED=1 \
     # Persist the FastEmbed ONNX model here so it survives restarts (mount a volume).
     FASTEMBED_CACHE_PATH=/app/.cache/fastembed
 
-# libgomp1 is required at runtime by onnxruntime (pulled in by fastembed).
+# libgomp1: required at runtime by onnxruntime (pulled in by fastembed).
+# libgl1 + libglib2.0-0: required by opencv, which RapidOCR (OCR fallback) uses.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends libgomp1 \
+    && apt-get install -y --no-install-recommends libgomp1 libgl1 libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -36,6 +37,17 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 
 # Persisted at runtime via volumes: uploaded PDFs + the embedding model cache.
 RUN mkdir -p /app/storage/documents /app/.cache/fastembed
+
+# Bake the ML models into the image so the container NEVER downloads them at
+# runtime. This eliminates the cold-start download (a stalled/partial fetch was
+# what made the chatbot fail with a misleading "language model unavailable"
+# error). FASTEMBED_CACHE_PATH is already /app/.cache/fastembed, so the models
+# land where the app expects them and are copied into the fastembed_cache volume
+# the first time the container starts. A longer HF timeout avoids silent hangs.
+ENV HF_HUB_DOWNLOAD_TIMEOUT=60
+RUN python -c "from app.services import embeddings, reranker; embeddings.warmup(); reranker.warmup()" \
+    && (python -c "from app.services import ocr; ocr.warmup()" \
+        || echo "OCR model warmup skipped at build; it will load lazily at runtime")
 
 EXPOSE 8000
 

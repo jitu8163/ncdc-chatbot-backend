@@ -16,6 +16,11 @@ class Settings(BaseSettings):
     environment: str = "development"
     log_level: str = "INFO"
     public_base_url: str = "http://localhost:8000"
+    # CORS allowed origins — comma-separated list of frontend URLs permitted to call
+    # this API from a browser. "*" allows any origin (convenient for local dev); in
+    # production set this to your real frontend domain(s), e.g.
+    # CORS_ORIGINS=https://rogsutra.org,https://www.rogsutra.org
+    cors_origins: str = "*"
 
     # Security
     secret_key: str = "change-me"
@@ -44,6 +49,11 @@ class Settings(BaseSettings):
     answer_cache_ttl: int = 3600        # 1 hour — cached grounded answers
     rate_limit_enabled: bool = True
     rate_limit_per_minute: int = 30     # /api/chat requests per client IP per minute
+    # Free messages an anonymous (not-signed-in) visitor may send before they must
+    # sign in to continue. Counted per client IP over a rolling 24h window (Redis).
+    # Set to 0 to require login for any chat. Enforced as a backstop — the frontend
+    # also gates locally, so the limit still nudges sign-up even if Redis is down.
+    anon_free_messages: int = 4
 
     # Answer LLM (OpenAI-compatible Chat Completions API).
     # Default points at Groq for sub-second generation; set OPENAI_API_KEY to your
@@ -113,6 +123,15 @@ class Settings(BaseSettings):
     embed_batch_size: int = 64
     upload_dir: str = "./storage/documents"
     max_upload_mb: int = 200
+
+    @property
+    def cors_origins_list(self) -> list[str]:
+        """`cors_origins` parsed into the list form Starlette's CORSMiddleware wants.
+        Accepts a comma-separated string; "*" (or blank) means allow any origin."""
+        raw = self.cors_origins.strip()
+        if not raw or raw == "*":
+            return ["*"]
+        return [o.strip() for o in raw.split(",") if o.strip()]
 
 
 @lru_cache

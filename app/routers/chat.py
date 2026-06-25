@@ -18,7 +18,7 @@ from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.database import get_db
-from app.deps import get_current_user
+from app.deps import get_current_user, get_optional_user
 from app.graph import build_citations, run_chat
 from app.models import ChatMessage, ChatSession, Feedback, QueryLog, User
 from app.schemas import ChatRequest, ChatResponse, ChatSessionSummary, Citation, FeedbackIn
@@ -33,21 +33,45 @@ def _normalize(q: str) -> str:
     return re.sub(r"\s+", " ", q.strip().lower())[:512]
 
 
-def _owned_session(db: Session, session_id: str | None, user: User) -> ChatSession | None:
+def _owned_session(
+    db: Session, session_id: str | None, user: User | None
+) -> ChatSession | None:
     """Fetch a session the caller is allowed to use, or None for 'start a new one'.
 
     Returns None when no id is given. Raises 404 if the id is unknown or belongs
     to another user (we 404 rather than 403 so we don't reveal that the id exists).
-    A legacy session with no owner is claimed by the current user.
+    An ownerless session (anonymous or legacy) is claimed by the current user once
+    they're signed in; an anonymous caller may keep using an ownerless session.
     """
     if not session_id:
         return None
     session = db.get(ChatSession, session_id)
-    if session is None or (session.user_id is not None and session.user_id != user.id):
+    owned_by_other = session is not None and session.user_id is not None and (
+        user is None or session.user_id != user.id
+    )
+    if session is None or owned_by_other:
         raise HTTPException(status_code=404, detail="Conversation not found")
-    if session.user_id is None:
+    if session.user_id is None and user is not None:
         session.user_id = user.id
     return session
+
+
+def _enforce_anon_quota(user: User | None, client_ip: str) -> None:
+    """Allow anonymous visitors a small free allowance, then require sign-in.
+
+    Counts this message against the caller's per-IP anonymous quota and raises 401
+    once it's exhausted, so the client can prompt the visitor to sign in. No-op for
+    signed-in users, and (by design) lenient if Redis is down — the frontend gates
+    locally too, so the limit still nudges sign-up.
+    """
+    if user is not None:
+        return
+    used = cache.incr_anon_messages(client_ip)
+    if used is not None and used > settings.anon_free_messages:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="You've used your free messages. Please sign in to keep chatting.",
+        )
 
 
 def _ndjson(event: dict) -> str:
@@ -93,7 +117,7 @@ def ask(
     payload: ChatRequest,
     request: Request,
     db: Session = Depends(get_db),
-    user: User = Depends(get_current_user),
+    user: User | None = Depends(get_optional_user),
 ):
     started = time.perf_counter()
 
@@ -104,12 +128,14 @@ def ask(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             detail="Too many requests. Please slow down and try again shortly.",
         )
+    # 0b) Anonymous free-message gate (signed-in users are unlimited here).
+    _enforce_anon_quota(user, client_ip)
 
     # 1) Resolve / create the session (enforcing per-user ownership).
     session = _owned_session(db, payload.session_id, user)
     is_new = session is None
     if session is None:
-        session = ChatSession(language=payload.language, user_id=user.id)
+        session = ChatSession(language=payload.language, user_id=user.id if user else None)
         db.add(session)
         db.flush()
 
@@ -183,7 +209,7 @@ def ask_stream(
     payload: ChatRequest,
     request: Request,
     db: Session = Depends(get_db),
-    user: User = Depends(get_current_user),
+    user: User | None = Depends(get_optional_user),
 ):
     """Same pipeline as `ask`, but streams the answer to the client as it is
     generated (newline-delimited JSON events: meta -> delta* -> done).
@@ -199,11 +225,13 @@ def ask_stream(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             detail="Too many requests. Please slow down and try again shortly.",
         )
+    # Anonymous free-message gate (signed-in users are unlimited here).
+    _enforce_anon_quota(user, client_ip)
 
     session = _owned_session(db, payload.session_id, user)
     is_new = session is None
     if session is None:
-        session = ChatSession(language=payload.language, user_id=user.id)
+        session = ChatSession(language=payload.language, user_id=user.id if user else None)
         db.add(session)
         db.flush()
     session_id = session.id
@@ -415,12 +443,12 @@ def list_sessions(db: Session = Depends(get_db), user: User = Depends(get_curren
 def get_session(
     session_id: str,
     db: Session = Depends(get_db),
-    user: User = Depends(get_current_user),
+    user: User | None = Depends(get_optional_user),
 ):
     session = _owned_session(db, session_id, user)
     if not session:
         raise HTTPException(status_code=404, detail="Conversation not found")
-    db.commit()  # persist owner-claim of any legacy session
+    db.commit()  # persist owner-claim of any ownerless session
     messages = []
     for m in session.messages:
         messages.append(
@@ -440,14 +468,16 @@ def get_session(
 def submit_feedback(
     payload: FeedbackIn,
     db: Session = Depends(get_db),
-    user: User = Depends(get_current_user),
+    user: User | None = Depends(get_optional_user),
 ):
     msg = db.get(ChatMessage, payload.message_id)
     if not msg:
         raise HTTPException(status_code=404, detail="Message not found")
-    # Only allow rating messages in the caller's own conversations.
+    # Only allow rating messages in the caller's own (or an ownerless) conversation.
     session = db.get(ChatSession, msg.session_id)
-    if session is None or (session.user_id is not None and session.user_id != user.id):
+    if session is None or (
+        session.user_id is not None and (user is None or session.user_id != user.id)
+    ):
         raise HTTPException(status_code=404, detail="Message not found")
     db.add(Feedback(message_id=payload.message_id, rating=payload.rating, comment=payload.comment))
     db.commit()
