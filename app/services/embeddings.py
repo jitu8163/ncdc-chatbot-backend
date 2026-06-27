@@ -21,7 +21,12 @@ from app.services import cache
 def _dense_model():
     from fastembed import TextEmbedding
 
-    return TextEmbedding(model_name=settings.embedding_model)
+    # Pass cache_dir explicitly so the model always resolves to our configured,
+    # persistent path — not FastEmbed's OS-temp default (which Windows wipes).
+    return TextEmbedding(
+        model_name=settings.embedding_model,
+        cache_dir=settings.fastembed_cache_path,
+    )
 
 
 def embed_texts(texts: list[str]) -> list[list[float]]:

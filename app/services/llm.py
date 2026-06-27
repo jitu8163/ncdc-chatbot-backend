@@ -1,4 +1,4 @@
-"""Grounded answer generation with gpt-4o-mini.
+"""Grounded answer generation via an OpenAI-compatible LLM provider (currently Groq).
 
 Enforces the SOW guardrails: answer strictly from supplied NCDC passages, never
 diagnose / prescribe / give clinical recommendations, stay multilingual, and emit
@@ -24,9 +24,79 @@ from app.config import settings
 
 logger = logging.getLogger(__name__)
 
-# Transient provider failures worth one quick retry before giving up (Groq's free
-# tier 429-rate-limits and occasionally times out under bursty testing).
+# Transient provider failures worth retrying before giving up. Free LLM tiers
+# 429-rate-limit AND occasionally return 503 "high demand" spikes
+# (InternalServerError) that hit every model, so a single retry isn't enough during
+# a sustained spike — we retry a few times with exponential backoff instead.
 _RETRYABLE_ERRORS = (RateLimitError, APITimeoutError, APIConnectionError, InternalServerError)
+
+# Retry schedule for transient provider errors: total attempts and the base backoff
+# (seconds) that doubles each retry (e.g. 0.8 → 1.6 → 3.2). When the provider tells
+# us how long to wait (a per-minute token/request limit reports a precise reset), we
+# honour that hint instead, capped so a single turn can't stall too long. The per-call
+# llm_request_timeout still bounds each individual attempt.
+_MAX_ATTEMPTS = 4
+_BACKOFF_BASE = 0.8
+# Cap on a single backoff sleep (seconds). Sized to ride out a per-MINUTE token
+# limit (whose reset hint is at most ~60s, often 10-20s) while still failing fast on
+# a per-DAY cap (whose hint is minutes — far over this cap, so we don't retry).
+_MAX_RETRY_WAIT = 20.0
+
+# Pull a "try again in 9.06s" hint out of a provider rate-limit message as a fallback
+# when there's no Retry-After header (Groq embeds it in the error text).
+_RETRY_AFTER_RE = re.compile(r"try again in ([0-9.]+)\s*s", re.IGNORECASE)
+
+
+def _retry_after_seconds(exc: Exception) -> float | None:
+    """Best-effort extraction of the provider's requested wait: the Retry-After
+    response header first, then a "try again in Xs" hint in the message body."""
+    resp = getattr(exc, "response", None)
+    if resp is not None:
+        hdr = resp.headers.get("retry-after") if getattr(resp, "headers", None) else None
+        if hdr:
+            try:
+                return float(hdr)
+            except ValueError:
+                pass
+    m = _RETRY_AFTER_RE.search(str(exc))
+    return float(m.group(1)) if m else None
+
+
+def _call_with_retries(make_call, *, what: str):
+    """Invoke `make_call()` (a zero-arg callable returning the SDK response/stream),
+    retrying transient provider errors with backoff. Honours the provider's
+    Retry-After hint when present, else exponential backoff. Raises the last error
+    once all attempts are exhausted. For streams the call returns before any token
+    is consumed, so a retry can never duplicate output."""
+    last_exc: Exception | None = None
+    for attempt in range(_MAX_ATTEMPTS):
+        try:
+            return make_call()
+        except _RETRYABLE_ERRORS as exc:
+            last_exc = exc
+            if attempt >= _MAX_ATTEMPTS - 1:
+                break
+            hinted = _retry_after_seconds(exc)
+            # A hint longer than we're ever willing to wait means a sustained limit
+            # (e.g. a per-day token cap reporting "try again in 7m36s") — retrying
+            # can't clear it within this request, so fail fast instead of sleeping
+            # the cap and retrying pointlessly.
+            if hinted is not None and hinted > _MAX_RETRY_WAIT:
+                logger.warning(
+                    "%s hit a sustained limit (%s, retry-after %.0fs); not retrying",
+                    what, type(exc).__name__, hinted,
+                )
+                break
+            backoff = _BACKOFF_BASE * (2 ** attempt)
+            # Add a small margin to the provider's hint so we clear the window.
+            delay = min(hinted + 0.3 if hinted else backoff, _MAX_RETRY_WAIT)
+            logger.warning(
+                "%s transient error (%s); retry %d/%d in %.1fs%s",
+                what, type(exc).__name__, attempt + 1, _MAX_ATTEMPTS - 1, delay,
+                " (provider hint)" if hinted else "",
+            )
+            time.sleep(delay)
+    raise last_exc  # type: ignore[misc]
 
 NO_INFO_MESSAGE = (
     "Relevant information could not be found in the available NCDC guideline documents."
@@ -43,13 +113,18 @@ SERVICE_BUSY_MESSAGE = (
 _client: OpenAI | None = None
 
 
-def _openai() -> OpenAI:
+def _openai_client() -> OpenAI:
+    """Return the (lazily built, cached) OpenAI-compatible client for the LLM provider.
+
+    The provider (currently Groq) exposes an OpenAI-compatible Chat Completions API,
+    so we drive it with the `openai` SDK pointed at llm_base_url — no provider-specific
+    SDK needed.
+    """
     global _client
     if _client is None:
-        # base_url=None -> OpenAI; set it for an OpenAI-compatible provider (e.g. Groq).
         _client = OpenAI(
-            api_key=settings.openai_api_key,
-            base_url=settings.openai_base_url or None,
+            api_key=settings.llm_api_key,
+            base_url=settings.llm_base_url,
             # Cap every call so a stalled provider can't exceed the latency budget
             # (the SDK default is 600s). Disable the automatic retries that would
             # otherwise multiply that wait on a transient error.
@@ -163,7 +238,9 @@ _SMALLTALK_RES: list[tuple[str, re.Pattern]] = [
         r"^\s*(?:hi+|hey+|hello+|hiya|yo|sup|namaste|namaskar|"
         r"good\s*(?:morning|afternoon|evening|day)|greetings|"
         r"how\s*are\s*you|who\s*(?:are\s*you|r\s*u)|what\s*(?:can\s*you\s*do|are\s*you)|"
-        r"what\s*can\s*you\s*help(?:\s*with)?)[\s!.?]*$",
+        r"what\s*can\s*you\s*help(?:\s*with)?)"
+        # Optional trailing address so "hi there", "hello everyone" still greet.
+        r"(?:\s+(?:there|all|everyone|folks|team|guys))?[\s!.?]*$",
         re.IGNORECASE)),
 ]
 
@@ -306,8 +383,8 @@ def route_query(question: str, history: list[dict] | None) -> dict:
     window = settings.chat_history_window
     convo = "\n".join(f"{t['role']}: {t['content']}" for t in history[-window:])
     try:
-        resp = _openai().with_options(timeout=settings.rewrite_timeout).chat.completions.create(
-            model=settings.rewrite_model or settings.openai_chat_model,
+        resp = _openai_client().with_options(timeout=settings.rewrite_timeout).chat.completions.create(
+            model=settings.llm_rewrite_model or settings.llm_chat_model,
             temperature=0.0,
             response_format={"type": "json_object"},
             messages=[
@@ -328,6 +405,15 @@ def route_query(question: str, history: list[dict] | None) -> dict:
         if regex_followup and route == "knowledge":
             route = "followup"
         return {"route": route, "query": query}
+    except _RETRYABLE_ERRORS as exc:
+        # Provider slow/unavailable (timeout, rate limit, transient 5xx). This is an
+        # expected, handled condition — the regex fallback below covers it — so log a
+        # concise warning rather than a full traceback.
+        logger.warning(
+            "Query routing unavailable (%s); using regex/standalone fallback",
+            type(exc).__name__,
+        )
+        return {"route": "followup" if regex_followup else "knowledge", "query": q}
     except Exception:  # noqa: BLE001
         logger.exception("Query routing failed; falling back to regex signal")
         return {"route": "followup" if regex_followup else "knowledge", "query": q}
@@ -342,6 +428,151 @@ def rewrite_query(question: str, history: list[dict] | None) -> str:
     return route_query(question, history)["query"]
 
 
+# ─── Context-aware analyzer (DIRECT / MEMORY / RAG) ──────────────────────────
+# The richer router used by app.services.conversation. It folds three jobs into a
+# single fast LLM call: pick the route, keep/refresh the active topic, and rewrite
+# the turn into a standalone, topic-resolved search query.
+DIRECT, MEMORY, RAG = "DIRECT", "MEMORY", "RAG"
+_ANALYZER_ROUTES = {DIRECT, MEMORY, RAG}
+
+_ANALYZER_SYSTEM_PROMPT = (
+    "You are the context analyzer for the NCDC Guideline Assistant, a RAG chatbot "
+    "over National Centre for Disease Control (NCDC) guideline documents. Using the "
+    "CONVERSATION, the current ACTIVE TOPIC and the user's LATEST message, decide how "
+    "to handle the turn and return STRICT JSON.\n\n"
+    "Pick exactly one route:\n"
+    "- \"RAG\": a NEW information need, usually on a NEW topic, that must be looked up "
+    "in the guideline documents. Examples: 'What is malaria?', 'Tell me about dengue', "
+    "'symptoms of cholera?'.\n"
+    "- \"MEMORY\": a message that depends on the conversation so far — it refers back "
+    "to the assistant's previous answer or to the ACTIVE TOPIC rather than opening a "
+    "new topic. This includes (a) meta questions about the last answer ('are you "
+    "sure?', 'why?', 'explain that', 'what do you mean?') AND (b) elliptical "
+    "follow-ups that ask for more specifics about the active topic ('how many "
+    "deaths?', 'when was that reported?', 'and in children?', 'tell me more'). These "
+    "are resolved using the active topic and previously retrieved context first.\n"
+    "- \"DIRECT\": a greeting, thanks, acknowledgement or farewell with no information "
+    "need ('hi', 'thanks', 'ok', 'bye').\n\n"
+    "Active topic rules: KEEP the current active topic for MEMORY turns — a follow-up "
+    "like 'are you sure?' or 'how many deaths?' must NOT change the topic. Only set a "
+    "new active_topic when the user genuinely introduces a new subject (a RAG turn). "
+    "For DIRECT turns repeat the current active topic unchanged.\n\n"
+    "Also produce \"rewritten_query\": a single standalone search query for the "
+    "knowledge base with all pronouns/references resolved from the active topic and "
+    "conversation (e.g. active topic 'dengue' + 'how many deaths?' -> 'How many "
+    "dengue deaths were reported?'). For DIRECT, repeat the message. Keep the user's "
+    "original language. Give a short \"reason\".\n\n"
+    'Respond ONLY with JSON: {"route": "DIRECT|MEMORY|RAG", "active_topic": "...", '
+    '"rewritten_query": "...", "reason": "..."}.'
+)
+
+
+def analyze_context_llm(
+    question: str,
+    history: list[dict] | None,
+    active_topic: str = "",
+) -> dict:
+    """One fast LLM call that classifies the turn (DIRECT/MEMORY/RAG), keeps/updates
+    the active topic and rewrites a standalone query. Returns a dict with keys
+    route, active_topic, rewritten_query, reason. Raises on provider error so the
+    caller can apply its deterministic fallback."""
+    window = settings.chat_history_window
+    convo = "\n".join(f"{t['role']}: {t['content']}" for t in (history or [])[-window:])
+    resp = _openai_client().with_options(timeout=settings.rewrite_timeout).chat.completions.create(
+        model=settings.llm_rewrite_model or settings.llm_chat_model,
+        temperature=0.0,
+        response_format={"type": "json_object"},
+        messages=[
+            {"role": "system", "content": _ANALYZER_SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": (
+                    f"ACTIVE TOPIC: {active_topic or '(none yet)'}\n\n"
+                    f"CONVERSATION:\n{convo or '(empty)'}\n\n"
+                    f"LATEST MESSAGE: {question}"
+                ),
+            },
+        ],
+    )
+    data = json.loads(resp.choices[0].message.content) or {}
+    route = str(data.get("route", "")).strip().upper()
+    if route not in _ANALYZER_ROUTES:
+        route = RAG
+    return {
+        "route": route,
+        "active_topic": (data.get("active_topic") or active_topic or "").strip(),
+        "rewritten_query": (data.get("rewritten_query") or question).strip() or question,
+        "reason": (data.get("reason") or "").strip(),
+    }
+
+
+# Answers a MEMORY follow-up from the conversation + previously retrieved context,
+# and—crucially—reports when that material is insufficient so the caller can fall
+# through to a fresh RAG retrieval instead of fabricating an answer.
+_MEMORY_SYSTEM_PROMPT = (
+    "You are the NCDC Guideline Assistant continuing a conversation. The user's "
+    "latest message is a FOLLOW-UP about the ACTIVE TOPIC / your previous answer. You "
+    "are given the CONVERSATION and the PREVIOUS CONTEXT (passages retrieved for the "
+    "earlier answer).\n\n"
+    "Decide:\n"
+    "1. If the CONVERSATION and/or PREVIOUS CONTEXT already contain what's needed, "
+    "answer the follow-up grounded in them — confirm, justify, clarify or expand. Set "
+    "\"answered\": true and \"needs_retrieval\": false. Cite the PREVIOUS CONTEXT "
+    "numbers you used in \"sources_used\" (or [] if you answered purely from the "
+    "conversation).\n"
+    "2. If answering needs NEW facts that are NOT present in the conversation or the "
+    "previous context (e.g. a specific number, date or detail that was never "
+    "retrieved), do NOT guess. Set \"needs_retrieval\": true, \"answered\": false and "
+    "leave \"answer\" empty — the system will look it up.\n\n"
+    "Never invent guideline facts and give no personal medical advice. Reply in the "
+    "user's language.\n\n"
+    'Respond ONLY with JSON: {"answer": "...", "answered": <bool>, '
+    '"needs_retrieval": <bool>, "sources_used": [<numbers>]}.'
+)
+
+
+def answer_from_context(
+    question: str,
+    passages: list[dict] | None,
+    history: list[dict] | None = None,
+    language: str | None = None,
+) -> dict:
+    """MEMORY route: try to answer a follow-up from the conversation + previously
+    retrieved passages. Returns {answer, answered, sources_used, needs_retrieval}.
+    When needs_retrieval is True the caller should run a fresh RAG lookup with the
+    rewritten query. On provider error, signals needs_retrieval so the turn degrades
+    to a normal retrieval rather than an error."""
+    lang_hint = f"\n\n(Respond in: {language})" if language else ""
+    ctx = _build_context(passages or [])
+    ctx_block = f"PREVIOUS CONTEXT:\n{ctx}\n\n" if ctx.strip() else "PREVIOUS CONTEXT: (none)\n\n"
+    messages = [
+        {"role": "system", "content": _MEMORY_SYSTEM_PROMPT},
+        *_history_messages(history),
+        {"role": "user", "content": f"{ctx_block}FOLLOW-UP: {question}{lang_hint}"},
+    ]
+    try:
+        resp = _create_chat_completion(messages, json_mode=True)
+        data = _loads_json_object(resp.choices[0].message.content or "") or {}
+    except Exception:  # noqa: BLE001
+        logger.exception("Memory answering failed; falling back to retrieval")
+        return {"answer": "", "answered": False, "sources_used": [], "needs_retrieval": True}
+
+    needs_retrieval = bool(data.get("needs_retrieval", False))
+    answer = (data.get("answer") or "").strip()
+    if not answer and not needs_retrieval:
+        # Model gave neither an answer nor a retrieval signal — prefer looking it up
+        # over deflecting.
+        needs_retrieval = True
+    answered = bool(data.get("answered", False)) and not needs_retrieval and bool(answer)
+    sources_used = [int(s) for s in data.get("sources_used", []) if isinstance(s, (int, float))]
+    return {
+        "answer": answer,
+        "answered": answered,
+        "sources_used": sources_used,
+        "needs_retrieval": needs_retrieval,
+    }
+
+
 def generate_title(question: str) -> str:
     """Summarise a conversation's first message into a short, specific title.
 
@@ -351,8 +582,8 @@ def generate_title(question: str) -> str:
     """
     fallback = re.sub(r"\s+", " ", (question or "New conversation").strip())[:60]
     try:
-        resp = _openai().with_options(timeout=settings.rewrite_timeout).chat.completions.create(
-            model=settings.rewrite_model or settings.openai_chat_model,
+        resp = _openai_client().with_options(timeout=settings.rewrite_timeout).chat.completions.create(
+            model=settings.llm_rewrite_model or settings.llm_chat_model,
             temperature=0.0,
             response_format={"type": "json_object"},
             messages=[
@@ -382,6 +613,11 @@ GREETING_REPLY = (
     "Hello! I'm the NCDC Guideline Assistant. Ask me anything about the NCDC "
     "guideline documents and I'll answer with citations to the source."
 )
+# Shown when the user greets *again* later in the same conversation — no need to
+# re-introduce the assistant, just a brief, friendly re-greeting.
+GREETING_AGAIN_REPLY = (
+    "Hello again! What would you like to know about the NCDC guidelines?"
+)
 ACK_REPLY = "Sure — let me know if there's anything else you'd like to ask about the NCDC guidelines."
 THANKS_REPLY = "You're welcome! Feel free to ask if you have any more questions about the NCDC guidelines."
 BYE_REPLY = "Goodbye! Come back anytime you have questions about the NCDC guidelines."
@@ -397,9 +633,15 @@ _SMALLTALK_REPLIES = {
 CHITCHAT_REPLY = GREETING_REPLY
 
 
-def smalltalk_reply(subtype: str | None) -> str:
+def smalltalk_reply(subtype: str | None, *, returning: bool = False) -> str:
     """Pick the reply for a smalltalk intent ("greeting"/"ack"/"thanks"/"bye").
-    Falls back to the acknowledgement reply for an unknown/None subtype."""
+
+    When ``returning`` is True (the conversation already has earlier turns), a
+    greeting gets the short "Hello again!" reply instead of the full first-time
+    self-introduction. Falls back to the acknowledgement reply for an unknown
+    /None subtype."""
+    if subtype == "greeting" and returning:
+        return GREETING_AGAIN_REPLY
     return _SMALLTALK_REPLIES.get(subtype or "", ACK_REPLY)
 
 
@@ -430,12 +672,7 @@ def generate_answer(
     )
 
     try:
-        resp = _openai().chat.completions.create(
-            model=settings.openai_chat_model,
-            messages=messages,
-            temperature=0.1,
-            response_format={"type": "json_object"},
-        )
+        resp = _create_chat_completion(messages, json_mode=True)
         data = json.loads(resp.choices[0].message.content)
     except Exception:  # noqa: BLE001
         logger.exception("LLM generation failed")
@@ -644,47 +881,33 @@ def stream_followup(
 
 
 def _create_chat_completion(messages: list[dict], *, json_mode: bool):
-    """Make a non-streaming chat completion, retrying once on a transient provider
-    error. Returns the SDK response. Used where reliable parsing matters more than
-    token-by-token streaming (e.g. short follow-up answers)."""
-    last_exc: Exception | None = None
-    kwargs: dict = {"model": settings.openai_chat_model, "messages": messages, "temperature": 0.1}
+    """Make a non-streaming chat completion, retrying transient provider errors
+    with exponential backoff. Returns the SDK response. Used where reliable parsing
+    matters more than token-by-token streaming (e.g. short follow-up answers)."""
+    kwargs: dict = {"model": settings.llm_chat_model, "messages": messages, "temperature": 0.1}
     if json_mode:
         kwargs["response_format"] = {"type": "json_object"}
-    for attempt in range(2):
-        try:
-            return _openai().chat.completions.create(**kwargs)
-        except _RETRYABLE_ERRORS as exc:
-            last_exc = exc
-            if attempt == 0:
-                logger.warning("LLM call transient error (%s); retrying once", type(exc).__name__)
-                time.sleep(0.8)
-    raise last_exc  # type: ignore[misc]
+    return _call_with_retries(
+        lambda: _openai_client().chat.completions.create(**kwargs), what="LLM call"
+    )
 
 
 def _create_chat_stream(messages: list[dict]):
-    """Open a streaming chat completion, retrying once on a transient provider
-    error (rate limit / timeout / connection / 5xx).
+    """Open a streaming chat completion, retrying transient provider errors (rate
+    limit / timeout / connection / 503 high-demand) with exponential backoff.
 
-    The retry happens before any token is consumed, so it can't duplicate output.
-    A short backoff gives a rate-limit window a moment to reset; the per-call
-    timeout still bounds the total wait.
+    The retry happens before any token is consumed, so it can't duplicate output;
+    the per-call timeout still bounds each attempt.
     """
-    last_exc: Exception | None = None
-    for attempt in range(2):
-        try:
-            return _openai().chat.completions.create(
-                model=settings.openai_chat_model,
-                messages=messages,
-                temperature=0.1,
-                stream=True,
-            )
-        except _RETRYABLE_ERRORS as exc:
-            last_exc = exc
-            if attempt == 0:
-                logger.warning("LLM stream transient error (%s); retrying once", type(exc).__name__)
-                time.sleep(0.8)
-    raise last_exc  # type: ignore[misc]
+    return _call_with_retries(
+        lambda: _openai_client().chat.completions.create(
+            model=settings.llm_chat_model,
+            messages=messages,
+            temperature=0.1,
+            stream=True,
+        ),
+        what="LLM stream",
+    )
 
 
 def _stream_json_answer(messages: list[dict]) -> Iterator[dict]:
@@ -697,11 +920,12 @@ def _stream_json_answer(messages: list[dict]) -> Iterator[dict]:
     shown_parts: list[str] = []
     try:
         # NOTE: we deliberately do NOT pass response_format={"type": "json_object"}
-        # here. Groq buffers the *entire* response into a single chunk when JSON
-        # mode is on, which defeats streaming (the answer arrives all at once).
-        # The SYSTEM_PROMPT already instructs the model to emit a JSON object, so
-        # we still get well-formed JSON — just streamed token-by-token, which the
-        # decoder below turns into live answer deltas.
+        # here. With JSON mode on, OpenAI-compatible providers (e.g. Groq, Gemini) tend
+        # to buffer the response rather than emit it token-by-token, which defeats
+        # streaming (the answer arrives all at once). The SYSTEM_PROMPT already
+        # instructs the model to emit a JSON object, so we still get well-formed
+        # JSON — just streamed incrementally, which the decoder below turns into
+        # live answer deltas.
         stream = _create_chat_stream(messages)
         for chunk in stream:
             if not chunk.choices:

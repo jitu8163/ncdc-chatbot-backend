@@ -55,28 +55,43 @@ class Settings(BaseSettings):
     # also gates locally, so the limit still nudges sign-up even if Redis is down.
     anon_free_messages: int = 4
 
-    # Answer LLM (OpenAI-compatible Chat Completions API).
-    # Default points at Groq for sub-second generation; set OPENAI_API_KEY to your
-    # Groq key. Leave openai_base_url empty to use OpenAI (gpt-4o-mini) instead.
-    openai_api_key: str = ""
-    openai_base_url: str | None = "https://api.groq.com/openai/v1"
-    openai_chat_model: str = "llama-3.1-8b-instant"
-    # Follow-up query rewrite runs *before* streaming starts, so it uses a small,
-    # fast model (the task is trivial) to keep time-to-first-token low. Falls back
-    # to openai_chat_model if left blank.
-    rewrite_model: str = "llama-3.1-8b-instant"
+    # Answer LLM — any OpenAI-compatible provider (currently Groq; was Google Gemini).
+    # We drive it through the well-tested `openai` SDK pointed at llm_base_url, so only
+    # these four settings (key, base URL, chat model, rewrite model) decide which
+    # provider answers — no provider-specific SDK. Get a free Groq key at
+    # https://console.groq.com/keys.
+    llm_api_key: str = ""
+    llm_base_url: str = "https://api.groq.com/openai/v1"
+    llm_chat_model: str = "llama-3.1-8b-instant"
+    # Follow-up query rewrite / routing runs *before* streaming starts, so it uses a
+    # smaller, faster model (the task is trivial) to keep time-to-first-token low.
+    # Falls back to llm_chat_model if left blank.
+    llm_rewrite_model: str = "llama-3.1-8b-instant"
     # Hard timeouts so a stalled provider can never blow the latency budget.
     # llm_request_timeout caps any single LLM call (the SDK default is 600s);
     # rewrite_timeout is a tighter cap on the pre-stream rewrite, which falls back
     # to the original question if the model is slow.
-    llm_request_timeout: float = 12.0
-    rewrite_timeout: float = 1.5
+    llm_request_timeout: float = 30.0
+    rewrite_timeout: float = 8.0
 
     # Multi-turn memory: how many of the most recent conversation messages (user +
     # assistant turns combined) are loaded as context for follow-up rewriting and
     # answer generation. ~16 ≈ the last 8 exchanges — enough for "Why?"/"Are you
     # sure?" follow-ups without bloating the prompt or latency.
     chat_history_window: int = 16
+
+    # Context-aware routing (DIRECT / MEMORY / RAG). The MEMORY route answers a
+    # follow-up from the previously retrieved context; only this many of the last
+    # RAG turn's passages are persisted in the conversation state (kept small so the
+    # session row and the memory prompt stay lean).
+    memory_context_passages: int = 4
+    # Retrieval guardrail: the cross-encoder reranker scores each (query, passage)
+    # pair; when the BEST passage scores below this floor the match is treated as too
+    # weak to answer from, so we say so / ask to rephrase instead of risking a
+    # fabricated answer. ms-marco logits roughly span -11..+11; the default is
+    # permissive (rarely trips) so it never silently suppresses good answers — raise
+    # it (e.g. -2.0) to be stricter. Set very low to effectively disable.
+    retrieval_min_score: float = -8.0
 
     # Paced streaming: artificial delay (seconds) inserted between word chunks sent
     # to the client so the answer is visibly typed out rather than appearing at the
@@ -88,6 +103,12 @@ class Settings(BaseSettings):
     embedding_model: str = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
     embedding_dim: int = 384
     embed_device: str = "cpu"           # unused by the ONNX path; kept for compatibility
+    # Where FastEmbed stores its downloaded ONNX models. Passed explicitly to every
+    # model so it works the same whether the app is run directly (uvicorn) or via
+    # PM2/Docker. The OS-temp default gets periodically wiped (Windows Storage Sense),
+    # leaving a half-deleted model that fails with a misleading "model unavailable"
+    # error — so keep this on a stable, persistent path.
+    fastembed_cache_path: str = "./.cache/fastembed"
 
     # Retrieval — dense vector search, then a cross-encoder reranker sharpens the
     # final ordering. retrieve_top_k is the wide candidate set fed to the reranker;

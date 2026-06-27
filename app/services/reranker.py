@@ -26,7 +26,12 @@ _lock = threading.Lock()
 def _model():
     from fastembed.rerank.cross_encoder import TextCrossEncoder
 
-    return TextCrossEncoder(model_name=settings.reranker_model)
+    # Pass cache_dir explicitly so the model always resolves to our configured,
+    # persistent path — not FastEmbed's OS-temp default (which Windows wipes).
+    return TextCrossEncoder(
+        model_name=settings.reranker_model,
+        cache_dir=settings.fastembed_cache_path,
+    )
 
 
 def warmup() -> None:

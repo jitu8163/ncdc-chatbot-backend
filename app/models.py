@@ -93,6 +93,10 @@ class ChatSession(Base):
     )
     title: Mapped[str | None] = mapped_column(String(255), nullable=True)
     language: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    # JSON-encoded ConversationState (active_topic, last_rag_query, last_rag_context,
+    # last_answer, conversation_summary) — powers the context-aware DIRECT/MEMORY/RAG
+    # router so follow-ups like "how many deaths?" stay on the active topic.
+    state_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
     messages: Mapped[list[ChatMessage]] = relationship(

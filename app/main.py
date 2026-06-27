@@ -7,6 +7,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy import inspect, text
 
 from app.config import settings
 from app.database import Base, SessionLocal, engine
@@ -28,6 +29,29 @@ for _name in ("uvicorn", "uvicorn.access", "uvicorn.error"):
     _lg = logging.getLogger(_name)
     _lg.handlers.clear()
     _lg.propagate = True
+
+
+def _ensure_schema() -> None:
+    """Apply the few additive columns that `create_all` can't add to pre-existing
+    tables. Idempotent and best-effort: checks the live schema first and only issues
+    an ADD COLUMN when the column is missing, so it's safe to run on every startup
+    against SQLite (dev) or PostgreSQL (prod) without a migration tool."""
+    # (table, column, DDL type) — append future additive columns here.
+    additions = [("chat_sessions", "state_json", "TEXT")]
+    inspector = inspect(engine)
+    for table, column, ddl_type in additions:
+        try:
+            existing = {c["name"] for c in inspector.get_columns(table)}
+        except Exception:  # noqa: BLE001 - table not created yet / inspect failed
+            continue
+        if column in existing:
+            continue
+        try:
+            with engine.begin() as conn:
+                conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {column} {ddl_type}"))
+            logger.info("Schema: added %s.%s", table, column)
+        except Exception:  # noqa: BLE001 - another worker may have added it first
+            logger.exception("Schema: could not add %s.%s (continuing)", table, column)
 
 
 def _seed_first_admin() -> None:
@@ -72,6 +96,7 @@ def _warmup_models() -> None:
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     Base.metadata.create_all(bind=engine)
+    _ensure_schema()
     _seed_first_admin()
     try:
         qdrant_service.ensure_collection()
@@ -85,7 +110,7 @@ async def lifespan(_: FastAPI):
 app = FastAPI(
     title=settings.app_name,
     version="0.1.0",
-    description="RAG chatbot over NCDC guideline documents (gpt-4o-mini + Qdrant).",
+    description="RAG chatbot over NCDC guideline documents (Groq LLM + Qdrant).",
     lifespan=lifespan,
 )
 

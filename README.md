@@ -6,7 +6,7 @@ page, section) and **clickable source links** — per the project SOW.
 
 - **Framework:** FastAPI (Python 3.11–3.13)
 - **Orchestration:** LangGraph (classify → rewrite → retrieve → generate → cite → format)
-- **Answer model:** OpenAI `gpt-4o-mini`
+- **Answer model:** Google `gemini-2.5-flash` (via its OpenAI-compatible API)
 - **Embeddings:** `BAAI/bge-m3` (dense, 1024-dim, local) + BM25 (sparse, FastEmbed)
 - **Vector DB:** Qdrant (native hybrid search, RRF fusion)
 - **Reranker:** `BAAI/bge-reranker-v2-m3` multilingual cross-encoder (sentence-transformers)
@@ -73,7 +73,7 @@ and a per-IP fixed-window rate limiter on `POST /api/chat` (`RATE_LIMIT_PER_MINU
 docker compose up -d
 
 # 2. Configure
-cp .env.example .env          # then edit: OPENAI_API_KEY, SECRET_KEY, DB creds, admin pwd
+cp .env.example .env          # then edit: GEMINI_API_KEY, SECRET_KEY, DB creds, admin pwd
 
 # 3. Install deps (uv) and run
 uv sync
@@ -139,7 +139,7 @@ app/
     qdrant_service.py hybrid search, upsert, enable/disable, delete
     reranker.py      bge-reranker-v2-m3 cross-encoder
     retrieval.py     hybrid recall -> rerank -> parent expansion (cached)
-    llm.py           grounded gpt-4o-mini answer + classifier + query rewriter
+    llm.py           grounded Gemini answer + classifier + query rewriter
     cache.py         Redis cache + rate limiting (best-effort)
     ingestion.py     extract -> chunk -> embed -> index (background)
 ```

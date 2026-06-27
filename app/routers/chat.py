@@ -22,7 +22,7 @@ from app.deps import get_current_user, get_optional_user
 from app.graph import build_citations, run_chat
 from app.models import ChatMessage, ChatSession, Feedback, QueryLog, User
 from app.schemas import ChatRequest, ChatResponse, ChatSessionSummary, Citation, FeedbackIn
-from app.services import cache, error_log, llm, retrieval
+from app.services import cache, conversation, error_log, llm, retrieval
 
 logger = logging.getLogger("ncdc.chat")
 
@@ -145,13 +145,16 @@ def ask(
     user_msg = ChatMessage(session_id=session.id, role="user", content=payload.question)
     db.add(user_msg)
 
-    # 3) Run the LangGraph pipeline (classify -> rewrite -> retrieve -> generate
-    #    -> citations -> format).
+    # 3) Run the LangGraph pipeline (analyze -> DIRECT | MEMORY | RAG -> ...),
+    #    threading the persisted conversation state in and back out.
+    conv_state = conversation.load_state(session.state_json)
     final = run_chat(
         question=payload.question,
         history=history,
         language=payload.language,
+        conv_state=conv_state,
     )
+    session.state_json = conversation.dump_state(final.get("conv_state") or conv_state)
     if final.get("error"):
         error_log.log_error(
             payload.question,
@@ -238,6 +241,8 @@ def ask_stream(
     # Build history before recording the current turn (the question is passed separately).
     history = [{"role": m.role, "content": m.content} for m in session.messages]
     db.add(ChatMessage(session_id=session_id, role="user", content=payload.question))
+    # Persisted conversation memory (active topic + last retrieved context, ...).
+    conv_state = conversation.load_state(session.state_json)
 
     delay = settings.stream_word_delay
 
@@ -248,85 +253,117 @@ def ask_stream(
         passages: list[dict] = []
         streamed_any = False
         logged_error = False
+        route = "?"
+        did_retrieve = False
         try:
-            # Fast local path: obvious smalltalk (greeting/ack/thanks/bye) gets an
-            # intent-appropriate canned reply — no LLM call, no retrieval. Crucially
-            # "ok"/"thanks" no longer trigger the full self-introduction.
-            smalltalk = llm.classify_smalltalk(payload.question)
-            if smalltalk:
-                answer = llm.smalltalk_reply(smalltalk)
+            # Context Analyzer: classify the turn (DIRECT / MEMORY / RAG), keep the
+            # active topic and rewrite a standalone query — shared with the graph so
+            # both chat paths route identically. Obvious smalltalk is settled locally
+            # with no LLM call.
+            info = conversation.analyze(payload.question, conv_state, history)
+            route = info["route"]
+            rewritten = info.get("rewritten_query") or payload.question
+            topic = info.get("active_topic", "")
+
+            if route == conversation.DIRECT:
+                # Greeting / ack / thanks / bye — a canned, intent-appropriate reply.
+                answer = llm.smalltalk_reply(info.get("subtype") or "", returning=bool(history))
                 for piece in _pace_words(_word_chunks(answer), delay):
                     yield _ndjson({"type": "delta", "text": piece})
                     streamed_any = True
                 final = {"answer": answer, "answered": True, "sources_used": []}
+                conversation.update_after_simple(
+                    conv_state, question=payload.question, answer=answer
+                )
             else:
                 # Tell the UI we're interpreting the question before retrieval kicks in.
                 yield _ndjson({"type": "status", "stage": "understanding"})
-                # The router (one small/fast LLM call) decides how to handle the turn
-                # AND rewrites the standalone search query in the same round-trip:
-                #   knowledge -> look the answer up in the vector DB
-                #   followup  -> answer from the conversation (the last reference)
-                #   smalltalk -> a pleasantry the local regex didn't catch
-                route_info = llm.route_query(payload.question, history)
-                route = route_info["route"]
-                search_query = route_info["query"]
+                do_rag = True
 
-                if route == "smalltalk":
-                    answer = llm.smalltalk_reply(route_info.get("subtype"))
-                    for piece in _pace_words(_word_chunks(answer), delay):
-                        yield _ndjson({"type": "delta", "text": piece})
-                        streamed_any = True
-                    final = {"answer": answer, "answered": True, "sources_used": []}
-                    logger.info("chat user=%s session=%s route=smalltalk", user.id, session_id)
-                else:
-                    followup = route == "followup" and bool(history)
-                    if followup:
-                        # Meta follow-ups are answered from the CONVERSATION, not from
-                        # freshly-retrieved chunks. Skipping retrieval keeps the request
-                        # small and fast: it avoids stuffing ~6 (often irrelevant)
-                        # passages into the prompt, which otherwise bloats token usage
-                        # (→ provider rate limits / timeouts) and distracts the model
-                        # into a wrong "no information found" reply.
-                        generate = llm.stream_followup
-                    else:
-                        # Relay each retrieval stage (embedding -> retrieving ->
-                        # reranking) to the client, then collect the passages.
-                        for event in retrieval.retrieve_staged(search_query):
-                            if "stage" in event:
-                                yield _ndjson({"type": "status", "stage": event["stage"]})
-                            else:
-                                passages = event["result"]
-                        generate = llm.stream_answer
-                    logger.info(
-                        "chat user=%s session=%s route=%s query=%r rewritten=%r retrieved=%d",
-                        user.id, session_id, route, payload.question, search_query, len(passages),
+                if route == conversation.MEMORY:
+                    # Try to answer from the previously retrieved context + history.
+                    mem = conversation.answer_from_memory(
+                        payload.question, conv_state, history, payload.language
                     )
-                    final_holder: list[dict] = []
+                    if not mem["needs_retrieval"]:
+                        do_rag = False
+                        answer = mem["answer"]
+                        # Cite against the remembered context so citations resolve.
+                        passages = conv_state.get("last_rag_context") or []
+                        final = {
+                            "answer": answer,
+                            "answered": mem["answered"],
+                            "sources_used": mem["sources_used"],
+                        }
+                        yield _ndjson({"type": "status", "stage": "generating"})
+                        for piece in _pace_words(_word_chunks(answer), delay):
+                            yield _ndjson({"type": "delta", "text": piece})
+                            streamed_any = True
+                        conversation.update_after_simple(
+                            conv_state, question=payload.question, answer=answer
+                        )
+                    # else: insufficient context -> fall through to a fresh RAG lookup.
 
-                    # Last stage before tokens start arriving.
-                    yield _ndjson({"type": "status", "stage": "generating"})
+                if do_rag:
+                    # RAG (or a MEMORY turn that needs new facts): retrieve on the
+                    # rewritten, topic-resolved query, relaying each stage to the UI.
+                    did_retrieve = True
+                    for event in retrieval.retrieve_staged(rewritten):
+                        if "stage" in event:
+                            yield _ndjson({"type": "status", "stage": event["stage"]})
+                        else:
+                            passages = event["result"]
 
-                    def text_deltas() -> Iterator[str]:
-                        for event in generate(
-                            question=payload.question,
-                            passages=passages,
-                            history=history,
-                            language=payload.language,
-                        ):
-                            if event["type"] == "delta":
-                                yield event["text"]
-                            else:
-                                final_holder.append(event)
+                    if conversation.is_weak_retrieval(passages):
+                        # Guardrail: nothing relevant enough — say so instead of
+                        # fabricating an answer. Streamed below via the not-streamed
+                        # fallback.
+                        final = {
+                            "answer": llm.NO_INFO_MESSAGE, "answered": False, "sources_used": [],
+                        }
+                    else:
+                        yield _ndjson({"type": "status", "stage": "generating"})
+                        final_holder: list[dict] = []
 
-                    for piece in _pace_words(text_deltas(), delay):
-                        yield _ndjson({"type": "delta", "text": piece})
-                        streamed_any = True
+                        def text_deltas() -> Iterator[str]:
+                            for event in llm.stream_answer(
+                                question=payload.question,
+                                passages=passages,
+                                history=history,
+                                language=payload.language,
+                            ):
+                                if event["type"] == "delta":
+                                    yield event["text"]
+                                else:
+                                    final_holder.append(event)
 
-                    final = final_holder[0] if final_holder else {
-                        "answer": llm.NO_INFO_MESSAGE,
-                        "answered": False,
-                        "sources_used": [],
-                    }
+                        for piece in _pace_words(text_deltas(), delay):
+                            yield _ndjson({"type": "delta", "text": piece})
+                            streamed_any = True
+
+                        final = final_holder[0] if final_holder else {
+                            "answer": llm.NO_INFO_MESSAGE, "answered": False, "sources_used": [],
+                        }
+                    conversation.update_after_rag(
+                        conv_state,
+                        active_topic=topic,
+                        rewritten_query=rewritten,
+                        passages=passages,
+                        question=payload.question,
+                        answer=final["answer"],
+                        answered=final["answered"],
+                    )
+
+            conversation.log_turn(
+                session_id=session_id,
+                route=route,
+                reason=info.get("reason", ""),
+                active_topic=conv_state.get("active_topic", ""),
+                rewritten_query=rewritten,
+                passages=passages if did_retrieve else None,
+                sources_used=final.get("sources_used"),
+                answered=final.get("answered"),
+            )
         except Exception as exc:  # noqa: BLE001 - never leak a 500 mid-stream
             error_log.log_error(
                 payload.question,
@@ -376,6 +413,9 @@ def ask_stream(
         # answer has already fully streamed, so this only gates the done event).
         if is_new and not session.title:
             session.title = llm.generate_title(payload.question)
+
+        # Persist the updated conversation memory (active topic, last context, ...).
+        session.state_json = conversation.dump_state(conv_state)
 
         latency_ms = int((time.perf_counter() - started) * 1000)
         db.add(
